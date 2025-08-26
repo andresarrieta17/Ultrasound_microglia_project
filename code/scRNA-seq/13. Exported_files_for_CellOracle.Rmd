@@ -1,0 +1,128 @@
+---
+title: "13. Exported_files_for_CellOracle"
+author: "Victor A. Arrieta"
+date: "2025-08-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+#This exports the 3545 DEGs for CellOracle
+```{r}
+# ------------------------------------------------------------------ #
+# 0.  Setup & load objects                                       
+# ------------------------------------------------------------------ #
+library(Seurat)
+library(Matrix)   # for writeMM()
+
+# your Seurat object with microglia (SCT + RNA assays)
+Microglia_filtered <- readRDS(
+  "Microglia_filtered.rds"
+)
+
+# ------------------------------------------------------------------ #
+# 1.  Read & filter your DEG table                                
+# ------------------------------------------------------------------ #
+deg_results <- read.csv(
+  "DEG_results_sonicated_vs_nonsonicated_microglia.csv",
+  stringsAsFactors = FALSE
+)
+
+# select all sig DEGs (adj-p < 0.05, any direction)
+deg_sig <- subset(
+  deg_results,
+  pvals_adj < 0.05
+)
+genes_deg <- deg_sig$gene
+cat("Exporting", length(genes_deg), "DEGs\n")
+
+# also write out the gene list for quick Python import
+write.table(
+  genes_deg,
+  file      = "deg_genes.txt",
+  quote     = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+# ------------------------------------------------------------------ #
+# 2.  Subset counts to DEGs & export                            
+# ------------------------------------------------------------------ #
+# switch to raw counts
+DefaultAssay(Microglia_filtered) <- "RNA"
+all_counts <- GetAssayData(Microglia_filtered, assay="RNA", slot="counts")
+
+# keep only rows matching your DEG set (in the same symbol namespace)
+keep <- intersect(genes_deg, rownames(all_counts))
+counts_sub <- all_counts[keep, ]
+
+# write matrix market
+writeMM(counts_sub, file = "counts.mtx")
+
+# ------------------------------------------------------------------ #
+# 3.  Export gene metadata (var)                                  
+# ------------------------------------------------------------------ #
+var_df <- data.frame(
+  gene_short_name = keep,
+  stringsAsFactors = FALSE
+)
+write.csv(
+  var_df,
+  file      = "var.csv",
+  quote     = FALSE,
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------------ #
+# 4.  Export cell metadata (obs)                                  
+# ------------------------------------------------------------------ #
+obs <- Microglia_filtered@meta.data
+obs$barcode <- rownames(obs)
+write.csv(
+  obs,
+  file      = "obs.csv",
+  quote     = FALSE,
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------------ #
+# 5.  Export UMAP embedding                                       
+# ------------------------------------------------------------------ #
+umap <- Embeddings(Microglia_filtered, "umap")
+write.csv(
+  umap,
+  file      = "X_umap.csv",
+  quote     = FALSE
+)
+
+# ------------------------------------------------------------------ #
+# 6.  Export cluster‐colour palette                               
+# ------------------------------------------------------------------ #
+# re‐use whatever palette you set previously
+combined_color_scale <- c(
+  "#D51F26","#272E6A","#208A42","#89288F","#F47D2B",
+  "#FEE500","#8A9FD1","#C06CAB","#E6C2DC","#90D5E4",
+  "#89C75F","#F37B7D"
+)
+palette_df <- data.frame(
+  cluster = levels(factor(obs$seurat_clusters)),
+  color   = combined_color_scale[seq_along(levels(factor(obs$seurat_clusters)))],
+  stringsAsFactors = FALSE
+)
+write.csv(
+  palette_df,
+  file      = "seurat_clusters_colors.csv",
+  quote     = FALSE,
+  row.names = FALSE
+)
+
+cat("✔️  Export complete for union-of-DEGs:\n",
+    "- counts.mtx  (", nrow(counts_sub), "genes ×", ncol(counts_sub), "cells )\n",
+    "- var.csv     (", nrow(var_df), "genes )\n",
+    "- obs.csv     (", nrow(obs), "cells )\n",
+    "- X_umap.csv  (", nrow(umap), "cells × 2 dims )\n",
+    "- palette CSV\n",
+    "- deg_genes.txt (", length(keep), "genes )\n"
+)
+
+```

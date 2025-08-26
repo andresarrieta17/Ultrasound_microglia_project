@@ -1,0 +1,385 @@
+---
+title: "6a. Cell annotation"
+author: "Victor A. Arrieta"
+date: "2025-08-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+set.seed(17)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+```
+
+#Microglia — filter, reprocess, and export
+Select microglia-related labels, rebuild a single SCT model (regressing patient_id), recluster/UMAP, and export counts/metadata.
+```{r}
+Microglia <- c("MG", "mgTAMs")
+
+# Subset microglia-related cells
+Microglia_filtered <- subset(integrated_data, subset = predicted.celltype_cor_gb %in% Microglia)
+# Remove neuroectodermal contamination
+Microglia_filtered <- subset(Microglia_filtered, subset = predicted.celltype_cor != "Neuroectodermal cells")
+
+```
+
+```{r}
+# Merge the separate count layers into a single counts matrix to create a unified model to then run SCTransform and have a single SCT model
+Microglia_filtered <- JoinLayers(
+  object = Microglia_filtered,
+  assay = "RNA"
+)
+
+DefaultAssay(Microglia_filtered) <- "RNA"
+Microglia_filtered <- SCTransform(
+  Microglia_filtered, assay = "RNA",
+  vars.to.regress = "patient",
+  vst.flavor = "v2",
+  variable.features.n = 3000,
+  return.only.var.genes = TRUE,
+  verbose = TRUE
+)
+
+DefaultAssay(Microglia_filtered) <- "SCT"
+Microglia_filtered <- RunPCA(Microglia_filtered, assay = "SCT",
+                             reduction.name = "pca_SCT", npcs = 13, verbose = TRUE)
+
+Microglia_filtered <- RunUMAP(Microglia_filtered, reduction = "pca_SCT",
+                              dims = 1:13, min.dist = 0.3, metric = "cosine",
+                              n.neighbors = 30, return.model = TRUE, verbose = TRUE)
+
+Microglia_filtered <- FindNeighbors(Microglia_filtered, reduction = "pca_SCT",
+                                    dims = 1:13, k.param = 20)
+
+Microglia_filtered <- FindClusters(Microglia_filtered,
+                                   graph.name = "SCT_snn",
+                                   resolution = 0.4, algorithm = 1, verbose = TRUE)
+```
+
+```{r}
+#Figure 1c
+
+# UMAP colored by sonication status
+color_sonivsnonsoni <- c("#00BCD4", "#542788")
+
+microglia_umap_data <- FetchData(Microglia_filtered, vars = c("umap_1", "umap_2", "orig.ident"))
+microglia_umap_data <- microglia_umap_data[sample(nrow(microglia_umap_data)), ]
+
+ggplot(microglia_umap_data, aes(umap_1, umap_2, color = orig.ident)) +
+  geom_point(alpha = 1, size = 0.3) +
+  scale_color_manual(values = color_sonivsnonsoni) +
+  theme_minimal() +
+  theme(panel.grid = element_blank(), axis.line = element_line(),
+        axis.ticks = element_blank(), axis.text = element_blank()) +
+  labs(title = "UMAP of Sonicated vs. Non-Sonicated Microglia", color = "Sonication Status")
+
+```
+
+```{r}
+#Extended Data Figure 2d
+
+# UMAP colored by patient ID
+microglia_umap_data <- FetchData(Microglia_filtered, vars = c("umap_1", "umap_2", "patient_id"))
+microglia_umap_data <- microglia_umap_data[sample(nrow(microglia_umap_data)), ]
+
+ggplot(microglia_umap_data, aes(umap_1, umap_2, color = patient_id)) +
+  geom_point(alpha = 1, size = 0.5) +
+  theme_minimal(base_size = 18) +
+  theme(panel.grid = element_blank(), axis.line = element_line(),
+        axis.ticks = element_blank(), axis.text = element_blank()) +
+  labs(title = "UMAP by Patient")
+
+```
+
+```{r}
+#Exported filed for further analysis in Python for DEG analysis
+# SCT counts, normalized data, and metadata
+write.csv(as.matrix(GetAssayData(Microglia_filtered, assay = "SCT", slot = "counts")),
+          file = "Microglia_SCT_raw_counts.csv")
+write.csv(as.matrix(GetAssayData(Microglia_filtered, assay = "SCT", slot = "data")),
+          file = "Microglia_SCT_normalized_data.csv")
+write.csv(Microglia_filtered@meta.data, file = "Microglia_metadata.csv")
+
+```
+
+#Macrophages — filter, reprocess, and export
+Select macrophage-related labels (CAMs/moTAMs), remove classical monocytes, rebuild SCT/UMAP/clusters, and export matrices.
+```{r}
+Macrophages_cor_gb <- c("CAMs", "moTAMs")
+
+Macrophages <- subset(integrated_data, subset = predicted.celltype_cor_gb %in% Macrophages_cor_gb)
+Macrophages <- subset(Macrophages, subset = predicted.celltype_cor != "Class. Mono")
+
+```
+
+```{r}
+Macrophages <- JoinLayers(Macrophages, assay = "RNA")
+Macrophages <- SCTransform(Macrophages, assay = "RNA", vars.to.regress = "patient_id", verbose = TRUE)
+Macrophages <- RunPCA(Macrophages, assay = "SCT", reduction.name = "pca_SCT", npcs = 12, verbose = TRUE)
+Macrophages <- RunUMAP(Macrophages, reduction = "pca_SCT", dims = 1:12, return.model = TRUE, verbose = TRUE)
+Macrophages <- FindNeighbors(Macrophages, reduction = "pca_SCT", dims = 1:12)
+Macrophages <- FindClusters(Macrophages, graph.name = "SCT_snn", resolution = 0.2)
+
+```
+
+```{r}
+#Extended Data Figure 2e
+# UMAP colored by sonication status
+macrophages_umap_data <- FetchData(Macrophages, vars = c("umap_1", "umap_2", "orig.ident"))
+set.seed(33)
+macrophages_umap_data <- macrophages_umap_data[sample(nrow(macrophages_umap_data)), ]
+
+ggplot(macrophages_umap_data, aes(umap_1, umap_2, color = orig.ident)) +
+  geom_point(alpha = 1, size = 2.0) +
+  scale_color_manual(values = color_sonivsnonsoni) +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid = element_blank(), axis.line = element_line(),
+        axis.ticks = element_blank(), axis.text = element_blank()) +
+  labs(title = "UMAP of Sonicated vs. Non-Sonicated Macrophages", color = "Sonication Status")
+
+```
+
+```{r}
+#Extended Data Figure 2e
+# UMAP colored by patient ID
+macrophages_umap_data <- FetchData(Macrophages, vars = c("umap_1", "umap_2", "patient_id"))
+macrophages_umap_data <- macrophages_umap_data[sample(nrow(macrophages_umap_data)), ]
+
+ggplot(macrophages_umap_data, aes(umap_1, umap_2, color = patient_id)) +
+  geom_point(alpha = 1, size = 2) +
+  theme_minimal(base_size = 18) +
+  theme(panel.grid = element_blank(), axis.line = element_line(),
+        axis.ticks = element_blank(), axis.text = element_blank()) +
+  labs(title = "UMAP by Patient")
+
+```
+
+```{r}
+#Exported filed for further analysis in Python for DEG analysis
+# SCT counts, normalized data, and metadata
+write.csv(as.matrix(GetAssayData(Macrophages, assay = "SCT", slot = "counts")),
+          file = "Macrophages_SCT_raw_counts.csv")
+write.csv(as.matrix(GetAssayData(Macrophages, assay = "SCT", slot = "data")),
+          file = "Macrophages_SCT_normalized_data.csv")
+write.csv(Macrophages@meta.data, file = "Macrophages_metadata.csv")
+
+```
+
+#Monocytes — filter, reprocess, and export
+Select classical/non-classical monocytes, rebuild SCT space, and export matrices.
+```{r}
+Monocytes_cor <- c("Class. Mono", "Non-Class. Mono")
+Monocytes <- subset(integrated_data, subset = predicted.celltype_cor %in% Monocytes_cor)
+
+```
+
+```{r}
+DefaultAssay(Monocytes) <- "SCT"
+
+Monocytes <- JoinLayers(Monocytes, assay = "RNA")
+Monocytes <- SCTransform(Monocytes, assay = "RNA", vars.to.regress = "patient_id", verbose = TRUE)
+Monocytes <- RunPCA(Monocytes, assay = "SCT", reduction.name = "pca_SCT", npcs = 10, verbose = TRUE)
+Monocytes <- RunUMAP(Monocytes, reduction = "pca_SCT", dims = 1:10, return.model = TRUE, verbose = TRUE)
+Monocytes <- FindNeighbors(Monocytes, reduction = "pca_SCT", dims = 1:10)
+Monocytes <- FindClusters(Monocytes, graph.name = "SCT_snn", resolution = 0.2)
+
+```
+
+```{r}
+##Exported filed for further analysis in Python for DEG analysis
+# SCT counts, normalized data, and metadata
+write.csv(as.matrix(GetAssayData(Monocytes, assay = "SCT", slot = "counts")),
+          file = "Monocytes_SCT_raw_counts.csv")
+write.csv(as.matrix(GetAssayData(Monocytes, assay = "SCT", slot = "data")),
+          file = "Monocytes_SCT_normalized_data.csv")
+write.csv(Monocytes@meta.data, file = "Monocytes_metadata.csv")
+
+```
+
+#Endothelial cells — filter and export
+Subset endothelial cells and remove likely non-endothelial contaminants using several metadata labels; export matrices.
+```{r}
+Endothelial <- subset(integrated_data, subset = predicted.annotation_level_3 %in% "Endothelial")
+
+Endothelial <- subset(Endothelial, subset = predicted.celltype_cor != "MG")
+Endothelial <- subset(Endothelial, subset = predicted.subclass != "Oligo")
+Endothelial <- subset(Endothelial, subset = SingleR_label != "Macrophage")
+Endothelial <- subset(Endothelial, subset = SingleR_label != "Monocyte")
+Endothelial <- subset(Endothelial, subset = SingleR_label != "DC")
+Endothelial <- subset(Endothelial, subset = SingleR_label != "Astrocyte")
+
+```
+
+```{r}
+##Exported filed for further analysis in Python for DEG analysis
+# SCT counts, normalized data, and metadata
+write.csv(as.matrix(GetAssayData(Endothelial, assay = "SCT", slot = "counts")),
+          file = "Endothelial_SCT_raw_counts.csv")
+write.csv(as.matrix(GetAssayData(Endothelial, assay = "SCT", slot = "data")),
+          file = "Endothelial_SCT_normalized_data.csv")
+write.csv(Endothelial@meta.data, file = "Endothelial_metadata.csv")
+
+```
+
+#T cells — subset only
+Join RNA layers once and subset T-related states using GBM-derived labels; produces a T_cells object for downstream work.
+```{r}
+# Join layers once, then subset T-related labels (using GBM-derived mapping)
+T_cells <- subset(integrated_data, subset = predicted.celltype_cor_gb %in% Tcells)
+
+# Define the cell types to isolate
+Tcells <- c("CD4 Naive", "CD4 TCM", "CD4 TEM", "CD8 Naive", "CD8 Proliferating", "CD8 TCM", "CD8 TEM", "dnT", "MAIT", "gdT", "Treg")
+
+#Run this first dataset
+T_cells <- subset(
+  integrated_data,
+  subset = predicted.celltype_cor_gb %in% Tcells
+)
+```
+
+#OPC — filter only (remove tumor-like states)
+Subset OPCs and exclude tumor-like subclasses to obtain a cleaner OPC population.
+```{r}
+OPC <- subset(integrated_data, subset = predicted.subclass == "OPC")
+OPC <- subset(OPC, subset = predicted.annotation_level_3 != "AC-like")
+OPC <- subset(OPC, subset = predicted.annotation_level_3 != "MES-like")
+OPC <- subset(OPC, subset = predicted.annotation_level_3 != "NPC-like")
+OPC <- subset(OPC, subset = predicted.annotation_level_3 != "OPC-like")
+
+```
+
+
+#Integrate final cell annotation
+Combine labels from filtered subsets, add quick mappings, then fill remaining NAs using multiple reference layers; visualize the final cell_phenotype across UMAP.
+```{r}
+# Helper to overwrite labels by barcode
+overwrite <- function(obj, cells, label) {
+  obj$cell_phenotype[cells] <- label
+  obj
+}
+
+# Initialize
+integrated_data$cell_phenotype <- NA_character_
+
+# Manual groups from filtered objects
+integrated_data <- integrated_data |>
+  overwrite(Cells(Microglia_filtered), "Microglia") |>
+  overwrite(Cells(Macrophages),       "Macrophage") |>
+  overwrite(Cells(Monocytes),         "Monocyte")   |>
+  overwrite(Cells(Endothelial),       "Endothelial")|>
+  overwrite(Cells(Astrocytes),       "Astrocyte")|>
+  overwrite(Cells(OPC),               "OPC")        |>
+  overwrite(Cells(T_cells),           "T cell")
+
+# Oligodendrocyte by Seurat clusters (dataset-specific)
+oligo_clusters <- c(1,28,8,5,17,0,26,16,2,7,11,27,15)
+oligo_cells    <- WhichCells(integrated_data, idents = oligo_clusters)
+integrated_data <- overwrite(integrated_data, oligo_cells, "Oligodendrocyte")
+
+# Quick maps / tumor grouping
+map_l3_quick <- c("Mural cell" = "Mural cell")
+tumor_labels <- c("MES-like","AC-like","NPC-like","OPC-like")
+
+map_vec <- c(
+  "NK"="NK","Plasmablast"="Plasmablast","pDC"="pDC","cDC2"="Dendritic cell",
+  "B intermediate"="B cells","B naive"="B cells","B memory"="B cells","HSPC"="HSPC"
+)
+
+integrated_data@meta.data <- integrated_data@meta.data %>%
+  mutate(
+    cell_phenotype = case_when(
+      is.na(cell_phenotype) & predicted.annotation_level_3 %in% names(map_l3_quick) ~ map_l3_quick[predicted.annotation_level_3],
+      is.na(cell_phenotype) & predicted.annotation_level_3 %in% tumor_labels        ~ "Tumor cells",
+      is.na(cell_phenotype) & predicted.celltype_cor_gb %in% names(map_vec)         ~ map_vec[predicted.celltype_cor_gb],
+      TRUE ~ cell_phenotype
+    )
+  )
+
+# Reference-layer fallbacks
+map_subclass <- c(Astro="Astrocyte", Endo="Endothelial", Oligo="Oligodendrocyte", OPC="OPC")
+map_cluster  <- c(
+  "Astro L1 FGFR3 SERPINI2"="Astrocyte","Astro L1-6 FGFR3 AQP1"="Astrocyte","Astro L1-6 FGFR3 PLCG1"="Astrocyte",
+  "Endo L2-5 NOSTRIN SRGN"="Endothelial","OPC L1-6 PDGFRA COL20A1"="OPC",
+  "Oligo L2-6 OPALIN FTH1P3"="Oligodendrocyte","Oligo L3-6 OPALIN ENPP6"="Oligodendrocyte",
+  "Oligo L3-6 OPALIN LRP4-AS1"="Oligodendrocyte","Oligo L5-6 OPALIN LDLRAP1"="Oligodendrocyte"
+)
+map_pbmc <- c(
+  "B intermediate"="B cells","B naive"="B cells","B memory"="B cells",
+  "CD14 Mono"="Monocyte","CD16 Mono"="Monocyte",
+  "CD4 TCM"="T cell","CD4 TEM"="T cell","dnT"="T cell","Treg"="T cell",
+  "CD8 Naive"="T cell","CD8 TEM"="T cell","NK"="NK","NK Proliferating"="NK",
+  "Plasmablast"="Plasmablast","pDC"="pDC","cDC2"="Dendritic cell","Platelet"="Platelet","HSPC"="HSPC"
+)
+
+map_l3_full <- c(
+  "AC-like"="AC-like","Astrocyte"="Astrocyte","B cell"="B cells","CD4/CD8"="T cell",
+  "DC"="Dendritic cell","Endothelial"="Endothelial","Mast"="Mast cell","MES-like"="MES-like",
+  "Mono"="Monocyte","Mural cell"="Mural cell","NK"="NK","NPC-like"="NPC-like",
+  "Oligodendrocyte"="Oligodendrocyte","OPC"="OPC","OPC-like"="OPC-like",
+  "Plasma B"="Plasmablast","RG"="RG","TAM-BDM"="Macrophage","TAM-MG"="Microglia"
+)
+
+na_cells  <- colnames(integrated_data)[is.na(integrated_data$cell_phenotype)]
+na_subset <- subset(integrated_data, cells = na_cells)
+
+na_subset@meta.data <- na_subset@meta.data %>%
+  mutate(cell_phenotype = coalesce(
+    if_else(predicted.subclass.score >= 0.6 & predicted.subclass %in% names(map_subclass), map_subclass[predicted.subclass], NA_character_),
+    if_else(predicted.celltype.l2.score >= 0.6 & predicted.celltype.l2 %in% names(map_pbmc), map_pbmc[predicted.celltype.l2], NA_character_),
+    if_else(predicted.cluster.score    >= 0.6 & predicted.cluster    %in% names(map_cluster), map_cluster[predicted.cluster], NA_character_),
+    if_else(predicted.annotation_level_3.score >= 0.6 & predicted.annotation_level_3 %in% names(map_l3_full), map_l3_full[predicted.annotation_level_3], NA_character_),
+    "Low-quality"
+  ))
+
+# Copy back
+integrated_data$cell_phenotype[na_cells] <- na_subset$cell_phenotype
+
+```
+
+```{r}
+final_levels <- c(
+  "Astrocyte","OPC","RG","Macrophage","Platelet","Endothelial","B cells","pDC","Mural cell",
+  "Plasmablast","Dendritic cell","Monocyte","Oligodendrocyte","HSPC","Microglia","NK","T cell","Tumor cells","Low-quality"
+)
+
+colors_vector_annotation6 <- c(
+  "Astrocyte"='#371377',"OPC"='#7700FF',"RG"='#9E0142',"Macrophage"='#FF0080',
+  "Platelet"='#DC494C',"Endothelial"="#FF4500","B cells"="#FAD510","pDC"="#FFFF5F",
+  "Mural cell"='#0df600',"Plasmablast"='#238B45',"Dendritic cell"="#02401B","Monocyte"="#00d4ff",
+  "Oligodendrocyte"='#1e99d1',"HSPC"="#046C9A","Microglia"='#542788',"NK"="#8A2BE2",
+  "T cell"="#f769a1","Tumor cells"="#C06CAB","Low-quality"='grey30'
+)
+
+integrated_data$cell_phenotype <- factor(integrated_data$cell_phenotype, levels = final_levels)
+
+table(integrated_data$cell_phenotype, useNA = "ifany")
+
+
+#Figure 1b
+DimPlot(
+  integrated_data,
+  group.by = "cell_phenotype",
+  label    = FALSE,
+  cols     = colors_vector_annotation6,
+  pt.size  = 0.4,
+  raster   = FALSE
+) +
+  theme(
+    legend.title = element_text(size = 16),
+    legend.text  = element_text(size = 14),
+    axis.title   = element_text(size = 14),
+    axis.text    = element_text(size = 12)
+  )
+
+```
+
+```{r}
+# Save final annotated object (relative path)
+saveRDS(integrated_data, file = "integrated_data_final.rds")
+```
+

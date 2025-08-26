@@ -1,0 +1,521 @@
+---
+title: "2. Cell_annotation_multiome_dataset"
+author: "Victor A. Arrieta"
+date: "2025-08-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+To install Azimuth for cell annotation
+```{r}
+#These lines use the devtools package to install the same repositories but with a specific reference (or branch) ref = "seurat5". This means that instead of installing the default branch (usually master or main), it will install from the branch named seurat5. This could be a development branch with features that are not yet in the default branch. Ultimately, these packages allowed the use of Azimuth for cell annotation of the dataset.
+
+devtools::install_github("satijalab/seurat", "seurat5") #Important to install this 
+devtools::install_github("satijalab/seurat-data", "seurat5")
+remotes::install_github('satijalab/azimuth', ref = 'master')
+remotes::install_github("satijalab/seurat-wrappers", quiet = TRUE)
+
+
+install.packages("Seurat")
+remove.packages("Seurat")
+library(Seurat)
+library(Azimuth)
+library(SeuratData)
+library(patchwork)
+library(ArchR)
+library(Matrix)
+library(SummarizedExperiment)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+addArchRGenome("hg38")   # already used upstream in your workflow
+set.seed(7)
+```
+
+#Extract RNA (GeneExpressionMatrix) from ArchR and build a Seurat object
+```{r}
+# 1) Pull the GeneExpressionMatrix from ArchR
+stopifnot("GeneExpressionMatrix" %in% getAvailableMatrices(projatac_filtered_with_RNA))
+
+gem <- getMatrixFromProject(
+  ArchRProj = projatac_filtered_with_RNA,
+  useMatrix = "GeneExpressionMatrix"
+)
+
+expr <- assay(gem)  # dgCMatrix
+if (!inherits(expr, "dgCMatrix")) expr <- as(expr, "dgCMatrix")
+
+# 2) Use gene symbols from rowData$name (common for ArchR)
+rd <- rowData(gem)
+stopifnot("name" %in% colnames(rd))
+gene_names <- rd$name
+
+# align rownames
+stopifnot(nrow(expr) == length(gene_names))
+rownames(expr) <- make.unique(gene_names)
+
+# 3) Build Seurat object
+seurat_obj <- CreateSeuratObject(
+  counts       = expr,
+  project      = "ArchR_RNA",
+  min.cells    = 0,
+  min.features = 0
+)
+DefaultAssay(seurat_obj) <- "RNA"
+```
+
+#Run Azimuth (Human cortex reference) on the RNA Seurat object
+```{r}
+# Ensure the default assay is set to 'RNA'
+DefaultAssay(seurat_obj) <- "RNA"
+
+# Run Azimuth (Initial one)
+seurat_obj <- RunAzimuth(seurat_obj,
+  reference = "humancortexref",
+  assay = "RNA",
+  verbose = TRUE
+)
+
+# View the updated metadata
+head(seurat_obj@meta.data)
+
+# List all metadata columns
+colnames(seurat_obj@meta.data)
+
+# Inspect available prediction columns
+az_cols <- colnames(seurat_obj@meta.data)
+print(az_cols)
+
+```
+
+#Transfer Azimuth labels back into ArchR (both subclass & class, if present)
+```{r}
+# Helper: pick the first column that exists
+first_present <- function(nms, candidates) {
+  intersect(candidates, nms)[1]
+}
+
+# Candidates commonly produced by Azimuth cortex ref
+cand_subclass <- c("predicted.subclass", "predicted.celltype.l2", "predicted.subclass.l2")
+cand_class    <- c("predicted.class",    "predicted.celltype.l1", "predicted.class.l1")
+
+col_sub <- first_present(az_cols, cand_subclass)
+col_cls <- first_present(az_cols, cand_class)
+
+if (!is.na(col_sub)) {
+  projatac_filtered_with_RNA <- addGeneIntegrationMatrix(
+    ArchRProj   = projatac_filtered_with_RNA,
+    useMatrix   = "GeneExpressionMatrix",
+    matrixName  = "GeneIntegrationMatrix_sub",
+    reducedDims = "Harmony_combined",
+    seRNA       = seurat_obj,
+    addToArrow  = TRUE,
+    groupRNA    = col_sub,                     # Azimuth subclass column
+    nameCell    = "predictedCell_subclass",
+    nameGroup   = "predictedGroup_subclass",
+    nameScore   = "predictedScore_subclass",
+    force       = TRUE
+  )
+} else {
+  message("No Azimuth subclass column found; skipping subclass integration.")
+}
+
+if (!is.na(col_cls)) {
+  projatac_filtered_with_RNA <- addGeneIntegrationMatrix(
+    ArchRProj   = projatac_filtered_with_RNA,
+    useMatrix   = "GeneExpressionMatrix",
+    matrixName  = "GeneIntegrationMatrix_cls",
+    reducedDims = "Harmony_combined",
+    seRNA       = seurat_obj,
+    addToArrow  = TRUE,
+    groupRNA    = col_cls,                     # Azimuth class column
+    nameCell    = "predictedCell_class",
+    nameGroup   = "predictedGroup_class",
+    nameScore   = "predictedScore_class",
+    force       = TRUE
+  )
+} else {
+  message("No Azimuth class column found; skipping class integration.")
+}
+
+```
+
+
+```{r}
+# Generate UMAP plot for the predicted subclass
+p1 <- plotEmbedding(
+  ArchRProj = projatac_filtered_with_RNA, 
+  colorBy = "cellColData", 
+  name = "predictedGroup_subclass", 
+  embedding = "UMAP_Harmony_combined",
+  labelMeans = FALSE  # Turn off the labels
+)
+
+# Generate UMAP plot for the predicted subclass
+p2 <- plotEmbedding(
+  ArchRProj = projatac_filtered_with_RNA, 
+  colorBy = "cellColData", 
+  name = "predictedGroup_class", 
+  embedding = "UMAP_Harmony_combined",
+  labelMeans = FALSE  # Turn off the labels
+)
+
+p1
+p2
+```
+
+
+#GBMap for cell annotation
+```{r}
+# Source the modified Azimuth script (adjust path if necessary)
+source("/projects/p30997/r_projects/Single_cell_RNAseq_Microglia_project/modified_azimuth_for_cell_annotation.R")
+
+az_ref <- readRDS('/projects/p30997/r_projects/Multiome_scRNA_ATACseq_analysis/GBMap_processed.rds')
+
+# Check if PCA exists in the reference, and run it if needed
+if (!"pca" %in% Reductions(az_ref)) {
+    message("PCA is not present. Running PCA on the reference dataset.")
+    DefaultAssay(az_ref) <- 'RNA'
+    
+    # Identify the most variable features (genes)
+    az_ref <- FindVariableFeatures(az_ref, selection.method = 'vst', nfeatures = 2000, verbose = FALSE)
+    
+    # Scale the data based on those variable features
+    az_ref <- ScaleData(az_ref, verbose = FALSE)
+    
+    # Run PCA on the scaled data
+    az_ref <- RunPCA(az_ref, npcs = 30, verbose = FALSE)
+}
+
+# Remove any existing UMAP reduction first to avoid issues
+if ("umap" %in% Reductions(az_ref)) {
+    az_ref <- RunUMAP(az_ref, reduction = "pca", dims = 1:20, return.model = TRUE)
+} else {
+    message("Running UMAP on the reference dataset.")
+    az_ref <- RunUMAP(az_ref, reduction = "pca", dims = 1:20, return.model = TRUE)
+}
+
+# Check if UMAP has the model stored
+if (!is.null(Embeddings(az_ref, "umap")) && !is.null(az_ref@reductions$umap@misc$model)) {
+    message("UMAP model is stored correctly.")
+} else {
+    stop("UMAP model is not stored, please rerun UMAP with return.model = TRUE.")
+}
+
+# Clean up annotation names in the reference
+az_ref$annotation_level_4 <-
+  str_replace_all(az_ref$annotation_level_4, "[ ]", "_") %>%
+  str_replace_all(., "-", "_") %>%
+  str_replace_all(., "/", "_")
+
+# Load the homolog table
+homolog_table_path <- "homologs.rds"
+
+# Load the homolog table from the path
+homolog_table <- readRDS(homolog_table_path)
+
+# Check the structure of the homolog table to ensure it has the correct columns
+str(homolog_table)
+head(homolog_table)
+
+# Updated function to convert gene names
+ConvertGeneNames_1 <- function(object, homolog.table) {
+  # Extract the gene expression matrix from the Seurat object
+  expression_matrix <- GetAssayData(object, slot = "data")
+  
+  # Create a mapping vector: Ensembl IDs to Gene Names
+  ensembl_to_name <- setNames(homolog.table$Gene.name.human, homolog.table$Gene.stable.ID.human)
+  
+  # Replace Ensembl IDs with gene names
+  new_names <- ensembl_to_name[rownames(expression_matrix)]
+  
+  # Filter out NA values (in case some genes are not in the homolog table)
+  valid_genes <- !is.na(new_names)
+  
+  # Subset the expression matrix to keep only genes with valid names
+  expression_matrix <- expression_matrix[valid_genes, ]
+  
+  # Update the rownames to gene names
+  rownames(expression_matrix) <- new_names[valid_genes]
+  
+  # Create a new Seurat object with the updated gene names
+  new_seurat_object <- CreateSeuratObject(expression_matrix)
+  
+  # Transfer metadata back to the new Seurat object
+  new_seurat_object@meta.data <- object@meta.data
+  
+  # Return the new Seurat object
+  return(new_seurat_object)
+}
+
+# Apply the conversion function to the reference dataset
+az_ref <- ConvertGeneNames_1(
+  object = az_ref,
+  homolog.table = homolog_table
+)
+
+# Verify that the conversion worked
+head(rownames(az_ref))
+```
+
+```{r}
+# Check the names of the metadata columns in the reference dataset
+head(colnames(az_ref@meta.data))
+
+# Optionally, view the first few rows of the metadata to see the contents
+head(az_ref@meta.data)
+
+# Get the gene names from the Seurat object (reference dataset)
+seurat_gene_names <- rownames(az_ref)
+
+head(seurat_gene_names)
+
+# Compare overlap
+common_genes <- intersect(gene_names, seurat_gene_names)
+length(common_genes)  # Number of overlapping genes
+
+```
+
+#Using GBMap as a reference dataset to annotate the single-cell multiome dataset
+```{r}
+# Perform the gene integration matrix addition with the correct cell type column
+projatac_filtered_with_RNA <- addGeneIntegrationMatrix(
+  ArchRProj = projatac_filtered_with_RNA, 
+  useMatrix = "GeneExpressionMatrix", 
+  matrixName = "GeneIntegrationMatrix", 
+  reducedDims = "Harmony_combined", 
+  seRNA = az_ref,  # Reference scRNA-seq dataset
+  addToArrow = TRUE, 
+  groupRNA = "annotation_level_4",  # Use the correct cell type annotation column
+  nameCell = "predictedCell_level_4", 
+  nameGroup = "predictedGroup_level_4", 
+  nameScore = "predictedScore_level_4", 
+  force = TRUE
+)
+
+# Perform the gene integration matrix addition with the correct cell type column
+projatac_filtered_with_RNA <- addGeneIntegrationMatrix(
+  ArchRProj = projatac_filtered_with_RNA, 
+  useMatrix = "GeneExpressionMatrix", 
+  matrixName = "GeneIntegrationMatrix", 
+  reducedDims = "Harmony_combined", 
+  seRNA = az_ref,  # Reference scRNA-seq dataset
+  addToArrow = TRUE, 
+  groupRNA = "annotation_level_3",  # Use the correct cell type annotation column
+  nameCell = "predictedCell_level_3", 
+  nameGroup = "predictedGroup_level_3", 
+  nameScore = "predictedScore_level_3", 
+  force = TRUE
+)
+
+# Perform the gene integration matrix addition with the correct cell type column
+projatac_filtered_with_RNA <- addGeneIntegrationMatrix(
+  ArchRProj = projatac_filtered_with_RNA, 
+  useMatrix = "GeneExpressionMatrix", 
+  matrixName = "GeneIntegrationMatrix", 
+  reducedDims = "Harmony_combined", 
+  seRNA = az_ref,  # Reference scRNA-seq dataset
+  addToArrow = TRUE, 
+  groupRNA = "annotation_level_2",  # Use the correct cell type annotation column
+  nameCell = "predictedCell_level_2", 
+  nameGroup = "predictedGroup_level_2", 
+  nameScore = "predictedScore_level_2", 
+  force = TRUE
+)
+```
+
+Generate UMAP Plot Based on Predicted Cell Annotations
+```{r}
+# UMAP plot for predicted annotations level 4
+p1 <- plotEmbedding(
+  ArchRProj = projatac_filtered_with_RNA, 
+  colorBy = "cellColData", 
+  name = "predictedGroup_level_4", 
+  embedding = "UMAP_Harmony_combined",
+    labelMeans = FALSE  # Turn off the labels
+)
+
+# Remove the legend
+p1 + theme(legend.position = "none")
+# UMAP plot with the legend
+p1
+
+# UMAP plot for predicted annotations level 3
+p2 <- plotEmbedding(
+  ArchRProj = projatac_filtered_with_RNA, 
+  colorBy = "cellColData", 
+  name = "predictedGroup_level_3", 
+  embedding = "UMAP_Harmony_combined",
+    labelMeans = FALSE  # Turn off the labels
+)
+
+# Remove the legend
+p2 + theme(legend.position = "none")
+# UMAP plot with the legend
+p2
+
+# UMAP plot for predicted annotations level 2
+p3 <- plotEmbedding(
+  ArchRProj = projatac_filtered_with_RNA, 
+  colorBy = "cellColData", 
+  name = "predictedGroup_level_2", 
+  embedding = "UMAP_Harmony_combined",
+    labelMeans = FALSE  # Turn off the labels
+)
+
+# Remove the legend
+p3 + theme(legend.position = "none")
+# UMAP plot with the legend
+p3
+
+# Display the plots
+p1
+p2
+p3
+```
+
+#Using the gb_cor from Sankowski et al. Nature Medicine as a reference dataset to annotate cells in the single-cell multiome dataset
+```{r}
+#To load 
+gb_Sankowski <- readRDS('gb_Sankowski.rds')
+```
+
+```{r}
+# 7) Re-run the integration into your ArchRProject
+projatac_filtered_with_RNA <- addGeneIntegrationMatrix(
+  ArchRProj   = projatac_filtered_with_RNA,
+  useMatrix   = "GeneExpressionMatrix",
+  matrixName  = "GeneIntegrationMatrix",     # overwrite or pick a new name
+  reducedDims = "Harmony_combined",
+  seRNA       = gb_Sankowski,                  # the trimmed & ordered Seurat
+  addToArrow  = TRUE,
+  groupRNA    = "celltype_cor_gb",            # your target column
+  nameCell    = "predictedCell_pheno",
+  nameGroup   = "predictedGroup_pheno",
+  nameScore   = "predictedScore_pheno",
+  force       = TRUE
+)
+
+colnames(projatac_filtered_with_RNA@cellColData)
+```
+
+Generate UMAP Plot Based on Predicted Cell Annotations from the GBM dataset from Sankowski
+```{r}
+# UMAP plot for predicted annotations level 4
+p1 <- plotEmbedding(
+  ArchRProj = projatac_filtered_with_RNA, 
+  colorBy = "cellColData", 
+  name = "predictedGroup_pheno", 
+  embedding = "UMAP_Harmony_combined",
+    labelMeans = FALSE  # Turn off the labels
+)
+
+# Remove the legend
+p1 + theme(legend.position = "none")
+# UMAP plot with the legend
+p1
+```
+
+
+###Unconstrained integration###
+1. Create Confusion Matrix for Unconstrained Integration
+```{r}
+colnames(projatac_filtered_with_RNA@cellColData)
+
+# Define your custom color palette
+custom_pal <- c(
+  "Astrocytes"       = '#371377',
+  "GABAergic"        = "#6e4b9e",
+  "Glutamatergic"    = "#0c727c",
+  "Macrophages"      = '#FF0080',
+  "Microglia"        = '#542788',
+  "Dendritic cells"  = '#02401B', 
+  "Monocytes"        = "#00d4ff",
+  "Oligodendrocytes" = '#1e99d1',
+  "OPC"              = '#7700FF',
+  "T cells"          = "#f769a1")
+
+
+# Define a manual cluster → broad cell‐type map (all non‐myeloid)
+cluster_to_celltype <- c(
+  C1  = "GABAergic",    C2  = "GABAergic",    C3  = "GABAergic",
+  C4  = "GABAergic",    C5  = "GABAergic",    C6  = "GABAergic",
+  C7  = "Glutamatergic",C8  = "Glutamatergic",C9  = "Glutamatergic",
+  C10 = "Glutamatergic",C11 = "Glutamatergic",C12 = "Glutamatergic",
+  C13 = "Glutamatergic",C14 = "Glutamatergic",C15 = "Glutamatergic",
+  C16 = "Glutamatergic",C17 = "OPC",          C18 = "T cells",
+  # C19–C23 we will override below
+  C19 = "Macrophages",  C20 = "Microglia",    C21 = "Microglia",
+  C22 = "Microglia",    C23 = "Microglia",    C24 = "OPC",
+  C25 = "Astrocytes",   C26 = "OPC",          C27 = "Oligodendrocytes",
+  C28 = "Oligodendrocytes", C29 = "Oligodendrocytes", C30 = "Oligodendrocytes",
+  C31 = "Oligodendrocytes", C32 = "Oligodendrocytes", C33 = "Oligodendrocytes",
+  C34 = "Oligodendrocytes", C35 = "Oligodendrocytes", C36 = "Oligodendrocytes",
+  C37 = "Oligodendrocytes", C38 = "Oligodendrocytes", C39 = "Oligodendrocytes",
+  C40 = "Oligodendrocytes", C41 = "Oligodendrocytes", C42 = "Oligodendrocytes",
+  C43 = "Oligodendrocytes"
+)
+
+# Assign each cell by its ATAC cluster
+clusters <- projatac_filtered_with_RNA$combined_ham_clusters
+
+# Initialize a per-cell vector from the manual map
+assigned <- cluster_to_celltype[ as.character(clusters) ]
+names(assigned) <- names(clusters)  # cell barcodes
+
+
+# Override clusters C19–C23 (myeloid) using Sankowski's "predictedGroup_pheno"
+myeloid_clusts  <- paste0("C", 19:23)
+cells_override  <- which(clusters %in% myeloid_clusts)
+assigned[cells_override] <- projatac_filtered_with_RNA$predictedGroup_pheno[cells_override]
+
+# Write back into the ArchR object
+projatac_filtered_with_RNA$assigned_celltype <- assigned
+
+# Quick QC
+message("Assigned celltype counts:")
+print(table(projatac_filtered_with_RNA$assigned_celltype))
+```
+
+```{r}
+# Simplify sub‐labels into broad categories
+simple <- projatac_filtered_with_RNA$assigned_celltype
+
+# Myeloid cells
+simple[simple %in% c("MG", "mgTAMs")]                         <- "Microglia"
+simple[simple %in% c("CAMs", "moTAMs")]                       <- "Macrophages"
+simple[simple %in% c("Class. Mono", "Non-Class. Mono")]       <- "Monocytes"
+# Dendritic cells
+simple[simple == "cDC2"]                                      <- "Dendritic cells"
+# T cells
+simple[simple %in% c("CD4 TCM", "CD4 Proliferating", "CD8 TEM")] <- "T cells"
+
+# Store simplified in ArchR
+projatac_filtered_with_RNA$celltype_simple <- simple
+
+# QC counts
+print(table(projatac_filtered_with_RNA$celltype_simple))
+
+#Figure 4a#
+
+# UMAP plot with custom colors
+# Simplified celltype_simple
+p_simple <- plotEmbedding(
+  ArchRProj = projatac_filtered_with_RNA,
+  colorBy   = "cellColData",
+  name      = "celltype_simple",
+  embedding = "UMAP_Harmony_combined",
+  pal       = custom_pal,
+  size = 0.5,
+  labelGroups = "celltype_simple",  # show labels on plot
+  labelMeans  = FALSE,
+  labelColor  = "black"
+) + theme(legend.position="bottom")
+print(p_simple)
+
+
+#Save the final ArchR object
+#saveRDS(projatac_filtered_with_RNA, file = "projatac_filtered_with_RNA_final.rds")
+```

@@ -1,0 +1,101 @@
+---
+title: "3. Integration"
+author: "Victor A. Arrieta"
+date: "2025-08-24"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+set.seed(33)
+
+library(Seurat)
+library(SeuratData)  # for AvailableData()
+library(Azimuth)     # for RunAzimuth()
+
+```
+
+
+```{r}
+# List available datasets
+available_data <- AvailableData()
+available_data[grep("Azimuth", available_data[, 3]), 1:3]     
+
+
+#Apply Seurat to each object individually using the humancortexref
+nonsoni_objects_filtered <- lapply(nonsoni_objects_filtered, function(obj) {
+  RunAzimuth(obj, reference = "humancortexref")
+})
+soni_objects_filtered <- lapply(soni_objects_filtered, function(obj) {
+  RunAzimuth(obj, reference = "humancortexref")
+})
+
+#Apply Seurat to each object individually using the pbmcref
+nonsoni_objects_filtered <- lapply(nonsoni_objects_filtered, function(obj) {
+  RunAzimuth(obj, reference = "pbmcref")
+})
+soni_objects_filtered <- lapply(soni_objects_filtered, function(obj) {
+  RunAzimuth(obj, reference = "pbmcref")
+})
+```
+
+```{r combine-objects}
+# Combine the lists of Seurat objects
+all_samples <- c(nonsoni_objects_filtered, soni_objects_filtered)
+
+```
+
+#Integrate data
+### Select Integration Features
+```{r}
+# (Optional) Increase memory limit for large integrations
+options(future.globals.maxSize = 50 * 1024^3)
+
+# Select integration features and prepare SCT objects
+integration_features <- SelectIntegrationFeatures(
+  object.list = all_samples,
+  nfeatures   = 3000
+)
+
+all_samples <- PrepSCTIntegration(
+  object.list      = all_samples,
+  anchor.features  = integration_features,
+  verbose          = FALSE
+)
+
+# Find anchors and integrate (SCT)
+integration_anchors <- FindIntegrationAnchors(
+  object.list          = all_samples,
+  normalization.method = "SCT",
+  anchor.features      = integration_features,
+  dims                 = 1:30
+)
+
+integrated_data <- IntegrateData(
+  anchorset            = integration_anchors,
+  normalization.method = "SCT",
+  dims                 = 1:30
+)
+```
+
+```{r}
+# Downstream processing on integrated object
+DefaultAssay(integrated_data) <- "integrated"
+
+integrated_data <- RunPCA(integrated_data, npcs = 30, verbose = FALSE)
+integrated_data <- RunUMAP(integrated_data, reduction = "pca", dims = 1:20, min.dist = 0.3)
+integrated_data <- FindNeighbors(integrated_data, reduction = "pca", dims = 1:20)
+integrated_data <- FindClusters(integrated_data, resolution = 1.9)
+```
+
+#To create a new column to determine patient information
+```{r}
+# 1. Create a new metadata column called "patient" by removing the prefix:
+integrated_data$patient <- sub("^(Non-sonicated_|Sonicated_)", "",
+                                  integrated_data$patient_id)
+
+# 2. (Optional) Quick sanity check:
+table(integrated_data$patient)
+```

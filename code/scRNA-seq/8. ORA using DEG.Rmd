@@ -1,0 +1,256 @@
+---
+title: "8a. ORA using DEG"
+author: "Victor A. Arrieta"
+date: "2025-08-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+
+```
+
+#Load a DEG table (choose one file at a time)
+```{r}
+# Pick one result file to work with (swap as needed)
+deg_file <- "DEG_results_sonicated_vs_nonsonicated_microglia.csv"
+# Alternatives:
+# deg_file <- "DEG_results_sonicated_vs_nonsonicated_macrophages.csv"
+# deg_file <- "DEG_results_sonicated_vs_nonsonicated_monocytes.csv"
+# deg_file <- "DEG_results_sonicated_vs_nonsonicated_endothelial.csv"
+# deg_file <- "DEG_results_sonicated_vs_nonsonicated_T_cells.csv"
+
+deg_results <- read.csv(deg_file, stringsAsFactors = FALSE)
+head(deg_results)
+
+```
+
+#Split DEGs into up/down (by logFC) and define a universe
+```{r}
+# Expect columns: gene, pvals_adj, logfoldchanges
+stopifnot(all(c("gene","pvals_adj","logfoldchanges") %in% colnames(deg_results)))
+
+# Universe (can be changed to all expressed genes for the population of interest)
+universe_sym <- unique(deg_results$gene)
+
+sig_deg <- deg_results %>% filter(pvals_adj < 0.05)
+
+up_genes <- sig_deg %>%
+  filter(logfoldchanges > 0) %>%
+  pull(gene) %>% unique()
+
+down_genes <- sig_deg %>%
+  filter(logfoldchanges < 0) %>%
+  pull(gene) %>% unique()
+
+length(up_genes); length(down_genes)
+
+```
+
+#Heatmap of significant DEGs (Microglia example; split by condition)
+```{r}
+#Figure 1d
+
+# Assumes Microglia_filtered exists and contains "orig.ident" with levels:
+#   "Sonicated" and "Non-sonicated"
+# Uses SCT assay, per-gene Z-scored expression, split columns by condition.
+
+# 1) genes present in object
+gene_list <- intersect(sig_deg$gene, rownames(Microglia_filtered))
+cat(length(gene_list), "DEGs present in Microglia_filtered\n")
+
+# 2) get SCT data and Z-score by gene
+mat_data <- GetAssayData(Microglia_filtered, assay = "SCT", slot = "data")[gene_list, ]
+expr_mat <- t( scale( t(as.matrix(mat_data)) ) )  # genes x cells
+
+# 3) order columns: Sonicated then Non-sonicated (adjust if needed)
+Idents(Microglia_filtered) <- "orig.ident"
+soni_cells <- WhichCells(Microglia_filtered, idents = "Sonicated")
+non_cells  <- WhichCells(Microglia_filtered, idents = "Non-sonicated")
+expr_mat   <- expr_mat[, c(soni_cells, non_cells)]
+
+# 4) clamp to reduce extreme values
+p05 <- quantile(expr_mat, 0.05, na.rm = TRUE)
+p95 <- quantile(expr_mat, 0.95, na.rm = TRUE)
+expr_mat[expr_mat < p05] <- p05
+expr_mat[expr_mat > p95] <- p95
+
+# 5) order rows by logFC (most up in Sonicated at top)
+ordered_genes <- sig_deg %>%
+  filter(gene %in% rownames(expr_mat)) %>%
+  arrange(desc(logfoldchanges)) %>%
+  pull(gene)
+expr_mat <- expr_mat[ordered_genes, , drop = FALSE]
+
+# 6) color scale
+pal <- paletteContinuous("blueYellow", 100)
+
+# 7) split columns by condition and cluster within slices
+col_split <- Microglia_filtered$orig.ident[colnames(expr_mat)]
+col_split <- factor(col_split, levels = c("Sonicated","Non-sonicated"))
+
+ht <- Heatmap(
+  expr_mat,
+  name                 = "Z-score",
+  col                  = pal,
+  cluster_rows         = FALSE,
+  row_split            = NULL,
+  row_order            = seq_len(nrow(expr_mat)),
+  column_split         = col_split,
+  cluster_columns      = TRUE,
+  cluster_column_slices= TRUE,
+  column_gap           = unit(2, "mm"),
+  show_row_names       = FALSE,
+  show_column_names    = FALSE,
+  use_raster           = TRUE,
+  raster_device        = "png",
+  raster_quality       = 2
+)
+
+draw(ht)
+
+```
+
+#ORA (GO:BP) for up/down gene sets
+```{r}
+# Enrichment with gene symbols (keyType="SYMBOL")
+ora_up <- enrichGO(
+  gene          = up_genes,
+  universe      = universe_sym,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+ora_down <- enrichGO(
+  gene          = down_genes,
+  universe      = universe_sym,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+ora_up_df   <- as.data.frame(ora_up)   %>% mutate(Direction = "Sonicated")
+ora_down_df <- as.data.frame(ora_down) %>% mutate(Direction = "Non-Sonicated")
+
+head(ora_up_df); head(ora_down_df)
+```
+
+#Bubble plot of top enriched terms (combined)
+```{r}
+# take top N by adjusted p-value from each side
+top_n <- 13
+top_up   <- ora_up_df   %>% arrange(p.adjust) %>% slice_head(n = top_n)
+top_down <- ora_down_df %>% arrange(p.adjust) %>% slice_head(n = top_n)
+
+combined <- bind_rows(top_up, top_down)
+
+wrapText <- function(x, len = 44) {
+  sapply(x, function(y) if (nchar(y) > len) gsub(paste0("(.{",len,"})"), "\\1\n", y, perl=TRUE) else y, USE.NAMES = FALSE)
+}
+
+combined <- combined %>%
+  mutate(
+    Term_wrapped = wrapText(Description, 44),
+    Direction    = factor(Direction, levels = c("Sonicated","Non-Sonicated"))
+  )
+
+# keep plotting order stable (Sonicated group first, then Non-Sonicated)
+desired_order <- combined$Term_wrapped
+combined$Term_wrapped <- factor(combined$Term_wrapped, levels = rev(desired_order))
+
+custom_pal <- c("#ff3f0b","#f56a35","#e79578","white","#a7d8ed","#1f96c5","#1e91c0")
+
+
+ggplot(combined, aes(x = Direction, y = Term_wrapped)) +
+  geom_point(aes(size = Count, fill = p.adjust),
+             shape = 21, color = "black", stroke = 0.5) +
+  scale_fill_gradientn(colours = custom_pal, name = "Adj. p-value", trans = "log10") +
+  scale_size_continuous(range = c(5, 13), name = "Gene set size",
+                        guide = guide_legend(override.aes = list(fill = "black", color = "black"))) +
+  labs(x = "Condition", y = "GO:BP term") +
+  theme_minimal(base_family = "Helvetica") +
+  theme(
+    axis.text.x  = element_text(size = 20, colour = "black", angle = 45, hjust = 1),
+    axis.text.y  = element_text(size = 20, colour = "black"),
+    axis.title.y = element_text(size = 16, colour = "black"),
+    axis.title.x = element_text(size = 14, colour = "black"),
+    legend.title = element_text(size = 16, colour = "black"),
+    legend.text  = element_text(size = 16, colour = "black")
+  )
+
+```
+
+#Bubble plot per sonication condition
+#Sonication plot
+```{r}
+#Figure 1e, 1f, Extended Data Figure 3b, 3d
+
+son_terms <- combined %>%
+  filter(Direction == "Sonicated") %>%
+  arrange(p.adjust) %>%
+  mutate(Term_wrapped = factor(Term_wrapped, levels = rev(unique(Term_wrapped))))
+
+pmin <- min(son_terms$p.adjust); pmax <- max(son_terms$p.adjust)
+
+ggplot(son_terms, aes(x = Direction, y = Term_wrapped)) +
+  geom_point(aes(size = Count, fill = p.adjust), shape = 21, color = "black", stroke = 0.5) +
+  scale_fill_gradientn(colours = custom_pal, name = "Adj. p-value",
+                       limits = c(pmin, pmax), trans = "log10", oob = scales::squish) +
+  scale_size_continuous(range = c(5, 13), name = "Gene set size",
+                        guide = guide_legend(override.aes = list(fill = "black", color = "black"))) +
+  labs(x = NULL, y = "GO:BP term", title = "Top GO:BP — Sonicated") +
+  theme_minimal(base_family = "Helvetica") +
+  theme(
+    axis.text.x  = element_text(size = 10, colour = "black", angle = 30, hjust = 1),
+    axis.text.y  = element_text(size = 18, colour = "black"),
+    legend.title = element_text(size = 16, colour = "black"),
+    legend.text  = element_text(size = 16, colour = "black")
+  )
+
+```
+
+#No-sonication plot
+```{r}
+#Figure 1e, 1f, Extended Data Figure 3b, 3d
+
+non_terms <- combined %>%
+  filter(Direction == "Non-Sonicated") %>%
+  arrange(p.adjust) %>%
+  mutate(Term_wrapped = factor(Term_wrapped, levels = rev(unique(Term_wrapped))))
+
+pmin_ns <- min(non_terms$p.adjust); pmax_ns <- max(non_terms$p.adjust)
+
+ggplot(non_terms, aes(x = Direction, y = Term_wrapped)) +
+  geom_point(aes(size = Count, fill = p.adjust), shape = 21, color = "black", stroke = 0.5) +
+  scale_fill_gradientn(colours = custom_pal, name = "Adj. p-value",
+                       limits = c(pmin_ns, pmax_ns), trans = "log10", oob = scales::squish) +
+  scale_size_continuous(range = c(5, 13), name = "Gene set size",
+                        guide = guide_legend(override.aes = list(fill = "black", color = "black"))) +
+  labs(x = NULL, y = "GO:BP term", title = "Top GO:BP — Non-Sonicated") +
+  theme_minimal(base_family = "Helvetica") +
+  theme(
+    axis.text.x  = element_text(size = 10, colour = "black", angle = 30, hjust = 1),
+    axis.text.y  = element_text(size = 18, colour = "black"),
+    legend.title = element_text(size = 16, colour = "black"),
+    legend.text  = element_text(size = 16, colour = "black")
+  )
+
+```
+

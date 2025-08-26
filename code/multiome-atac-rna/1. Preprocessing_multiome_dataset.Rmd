@@ -1,0 +1,443 @@
+---
+title: "1a. Multiome scRNA+ATAC for Microglia Project"
+author: "Victor A. Arrieta"
+date: "2025-08-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+
+# One-time installs (run once, then keep disabled)
+# Short description: Install ArchR (dev for 10x h5 import), optional plotting deps, and MACS2 (if you plan to call peaks).
+```{r eval=FALSE}
+if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+if (!requireNamespace("devtools", quietly=TRUE))    install.packages("devtools")
+if (!requireNamespace("remotes", quietly=TRUE))     install.packages("remotes")
+
+# ArchR dev branch recommended for import10xFeatureMatrix support
+pkgbuild::check_build_tools(debug = TRUE)
+devtools::install_github("GreenleafLab/ArchR", ref = "dev", repos = BiocManager::repositories())
+
+# Optional (nice plots / motif sets)
+install.packages(c("Cairo","hexbin","pheatmap"), dependencies = TRUE)
+devtools::install_github("GreenleafLab/chromVARmotifs")
+remotes::install_github("RockefellerUniversity/Herper")  # for conda helper
+
+# If you need MACS2 via conda (optional; run where conda is available)
+# Herper::install_CondaTools(tools="macs2", env="PeakCalling_analysis", pathToMiniConda="./")
+
+# If you ever hit addDoubletScores compilation issues:
+# install.packages("irlba", type="source")
+# install.packages("Matrix", type="source")
+
+```
+
+#Load packages
+Load ArchR + helpers. Keep this chunk fast and stable.
+```{r}
+library(ArchR)
+library(GenomicRanges)
+library(SummarizedExperiment)
+library(pheatmap)
+library(igraph)
+library(Seurat)          # not strictly required here but useful later
+library(chromVARmotifs)  # optional; only needed for motif steps
+library(Cairo)           # optional; improves PDF/PNG output on macOS
+library(harmony)
+
+```
+
+#Global settings
+Set threads, seed, and reference genome.
+```{r}
+addArchRThreads(threads = 8)         # adjust to your machine or computer clusters
+set.seed(7)
+addArchRGenome("hg38")               # matches Cell Ranger ARC hg38 run
+```
+
+#Define paths
+Centralize input/output paths so you can move projects easily.
+```{r}
+# Base directories — edit to your environment
+base_dir      <- ".../Multiome_scRNA_ATACseq_analysis"
+atac_dir      <- file.path(base_dir, "ATAC")
+rna_dir       <- file.path(base_dir, "RNA_multiome")
+out_dir       <- base_dir
+
+# Optional: show where we are
+cat("ATAC dir:", atac_dir, "\nRNA dir :", rna_dir, "\nOut dir :", out_dir, "\n")
+```
+
+#Locate ATAC fragments
+Find *_fragments.tsv.gz and derive sample names.
+```{r}
+inputFiles <- list.files(atac_dir, pattern = "_fragments\\.tsv\\.gz$", full.names = TRUE)
+stopifnot(length(inputFiles) > 0)
+
+# Sample name = filename without suffix
+sample_names <- sub("_fragments\\.tsv\\.gz$", "", basename(inputFiles))
+names(inputFiles) <- sample_names
+
+print(inputFiles)
+
+```
+
+#Create (or load) Arrow files
+Create Arrow files once; otherwise load existing ones you transferred.
+```{r}
+# If Arrow files already exist, list them here:
+arrow_dir  <- getwd()
+arrow_list <- c("P8-nonsonicated.arrow",
+                "P8-sonicated.arrow",
+                "P10-nonsonicated.arrow",
+                "P10-sonicated.arrow")
+
+# If those files exist in the working dir, use them; otherwise create new arrows.
+have_arrows <- all(file.exists(file.path(arrow_dir, arrow_list)))
+
+if (!have_arrows) {
+  ArrowFiles <- createArrowFiles(
+    inputFiles      = inputFiles,
+    sampleNames     = names(inputFiles),
+    filterTSS       = 4,        # keep moderate here; you can tighten later
+    filterFrags     = 1000,
+    addTileMat      = TRUE,
+    addGeneScoreMat = TRUE
+  )
+} else {
+  ArrowFiles <- file.path(arrow_dir, arrow_list)
+}
+
+ArrowFiles
+
+```
+
+
+#CReate ArchR Project
+```{r}
+projatac <- ArchRProject(
+  ArrowFiles       = ArrowFiles,
+  outputDirectory  = out_dir,
+  copyArrows       = FALSE
+)
+projatac
+
+```
+
+#ATAC QC filters
+Filter by TSS enrichment and total fragments; keep a clean set for analysis.
+```{r}
+# TSS filter
+idxPass_TSS      <- which(projatac$TSSEnrichment >= 4)
+cellsPass_TSS    <- projatac$cellNames[idxPass_TSS]
+projatac_filt    <- projatac[cellsPass_TSS, ]
+
+# nFrags filter
+idxPass_nFrags   <- which(projatac_filt$nFrags >= 1000)
+cellsPass_nFrags <- projatac_filt$cellNames[idxPass_nFrags]
+projatac_filt    <- projatac_filt[cellsPass_nFrags, ]
+
+getAvailableMatrices(projatac_filt)
+
+```
+
+#ATAC QC plots
+Quick visual QC for fragment sizes and TSS enrichment.
+```{r}
+plotFragmentSizes(ArchRProj = projatac_filt)
+
+p_ridges <- plotGroups(
+  ArchRProj = projatac_filt,
+  groupBy   = "Sample",
+  colorBy   = "cellColData",
+  name      = "TSSEnrichment",
+  plotAs    = "ridges"
+)
+p_ridges
+
+plotTSSEnrichment(ArchRProj = projatac_filt)
+```
+
+#Load 10x RNA (multiome) data
+Read per-sample filtered_feature_bc_matrix.h5 and combine into a SummarizedExperiment.
+```{r}
+rna_paths <- c(
+  "P8-nonsonicated"  = file.path(rna_dir, "P8-nonsonicated",  "filtered_feature_bc_matrix.h5"),
+  "P8-sonicated"     = file.path(rna_dir, "P8-sonicated",     "filtered_feature_bc_matrix.h5"),
+  "P10-nonsonicated" = file.path(rna_dir, "P10-nonsonicated", "filtered_feature_bc_matrix.h5"),
+  "P10-sonicated"    = file.path(rna_dir, "P10-sonicated",    "filtered_feature_bc_matrix.h5")
+)
+stopifnot(all(file.exists(rna_paths)))
+
+# import10xFeatureMatrix is on ArchR (dev) branch
+seRNA <- import10xFeatureMatrix(
+  input       = rna_paths,
+  names       = names(rna_paths),
+  strictMatch = TRUE
+)
+seRNA
+
+```
+
+#Add RNA to ArchR project
+Attach the gene expression matrix to the ATAC project, drop cells without RNA.
+```{r}
+# How many ATAC cells lack RNA?
+length(which(getCellNames(projatac_filt) %ni% colnames(seRNA)))
+
+projatac_filt_rna <- addGeneExpressionMatrix(
+  input = projatac_filt,
+  seRNA = seRNA,
+  force = TRUE
+)
+
+# Keep cells with measured RNA UMI
+keep_rna <- !is.na(projatac_filt_rna$Gex_nUMI) & projatac_filt_rna$Gex_nUMI > 0
+projatac_filt_rna <- projatac_filt_rna[keep_rna, ]
+
+nrow(projatac_filt_rna@cellColData)
+head(projatac_filt_rna@cellColData)
+
+```
+
+#Save filtered project
+Save a checkpoint so you can resume from here.
+```{r}
+saveArchRProject(
+  ArchRProj        = projatac_filt_rna,
+  outputDirectory  = file.path(out_dir, "ProjATAC_with_RNA_filtered"),
+  load             = FALSE
+)
+
+```
+
+#Doublet detection & filtering
+Score and remove putative doublets using ArchR’s synthetic doublet approach.
+```{r}
+projatac_nodbl <- addDoubletScores(
+  ArchRProj = projatac_filt_rna,
+  force     = TRUE
+)
+
+projatac_filtered_with_RNA <- filterDoublets(projatac_nodbl)
+
+# Cells remaining
+nrow(projatac_filtered_with_RNA@cellColData)
+
+# (Optional) Save an RDS
+# saveRDS(projatac_filtered_with_RNA, file = file.path(out_dir, "projatac_filtered_with_RNA_noDoublets.rds")
+```
+
+#ArchR normalization and dimensionality reduction
+```{r}
+# Perform LSI on ATAC data
+projatac_filtered_with_RNA <- addIterativeLSI(
+  ArchRProj = projatac_filtered_with_RNA, 
+  useMatrix = "TileMatrix", 
+  name = "LSI_allcells_atac", 
+  iterations = 2, 
+  clusterParams = list(resolution = 2, sampleCells = 5000, maxClusters = 10),
+  varFeatures = 50000, 
+  dimsToUse = 1:30, 
+  LSIMethod = 2, 
+  force = TRUE
+)
+
+# Perform LSI on RNA data using Gex_nUMI as depthCol
+projatac_filtered_with_RNA <- addIterativeLSI(
+  ArchRProj = projatac_filtered_with_RNA, 
+  useMatrix = "GeneExpressionMatrix", 
+  name = "LSI_allcells_rna", 
+  iterations = 2, 
+  clusterParams = list(resolution = 2, sampleCells = 5000, maxClusters = 10),
+  varFeatures = 2500,  
+  dimsToUse = 1:30, 
+  LSIMethod = 2, 
+  depthCol = "Gex_nUMI",  # This is where Gex_nUMI is used
+  force = TRUE
+)
+
+```
+
+#Apply Harmony to correct batch effects
+```{r}
+# Run Harmony on ATAC data
+projatac_filtered_with_RNA <- addHarmony(
+    ArchRProj = projatac_filtered_with_RNA,
+    reducedDims = "LSI_allcells_atac",  # Correct ATAC data
+    name = "Harmony_ATAC",  # You can overwrite "Harmony" if needed
+    groupBy = "Sample",  # Correct by sample
+    force = TRUE
+)
+
+# Run Harmony on RNA data
+projatac_filtered_with_RNA <- addHarmony(
+    ArchRProj = projatac_filtered_with_RNA,
+    reducedDims = "LSI_allcells_rna",  # Correct RNA data
+    name = "Harmony_RNA",  # Again, overwrite or keep separate
+    groupBy = "Sample",  # Correct by sample
+    force = TRUE
+)
+
+```
+
+#Clustering
+```{r}
+# Add clusters for ATAC using Harmony dimensions
+projatac_filtered_with_RNA <- addClusters(
+  input = projatac_filtered_with_RNA, 
+  reducedDims = "Harmony_ATAC", 
+  name = "atac_ham_clusters",  
+  method = "Seurat", 
+  resolution = 6, 
+  force = TRUE, 
+  maxClusters = 80
+)
+
+# Add clusters for RNA using Harmony dimensions
+projatac_filtered_with_RNA <- addClusters(
+  input = projatac_filtered_with_RNA, 
+  reducedDims = "Harmony_RNA", 
+  name = "rna_ham_clusters",  
+  method = "Seurat", 
+  resolution = 6.5, 
+  force = TRUE, 
+  maxClusters =75
+)
+```
+
+#Adding UMAP Embeddings
+```{r}
+# Add UMAP embeddings for ATAC using Harmony dimensions
+projatac_filtered_with_RNA <- addUMAP(
+  ArchRProj = projatac_filtered_with_RNA,
+  reducedDims = "Harmony_ATAC",  # Correct dimension name for Harmony ATAC
+  name = "UMAP_Harmony_ATAC",
+  nNeighbors = 50,
+  minDist = 0.8,
+  metric = "cosine",
+  force = TRUE,
+  seed = 1 #you can change this and force it to make new shapes. Sometimes they look "prettier" than other times.
+)
+
+# Add UMAP embeddings for RNA using Harmony dimensions
+projatac_filtered_with_RNA <- addUMAP(
+  ArchRProj = projatac_filtered_with_RNA,
+  reducedDims = "Harmony_RNA",  # Correct dimension name for Harmony RNA
+  name = "UMAP_Harmony_RNA",
+  nNeighbors = 50,
+  minDist = 0.8,
+  metric = "cosine",
+  force = TRUE,
+  seed = 1 #you can change this and force it to make new shapes. Sometimes they look "prettier" than other times.
+)
+```
+
+```{r}
+# Create a sonication status metadata column
+projatac_filtered_with_RNA$SonicationStatus <- ifelse(projatac_filtered_with_RNA$Sample %in% c("P10-sonicated", "P8-sonicated"), 
+                                             "Sonicated", 
+                                             "Non-sonicated")
+
+# Verify the new column
+table(projatac_filtered_with_RNA$SonicationStatus)
+
+# Verify the changes by checking the first few updated cell names
+head(rownames(projatac_filtered_with_RNA@cellColData))
+```
+
+
+```{r}
+# Combine the Harmony-corrected ATAC and RNA dimensions
+projatac_filtered_with_RNA <- addCombinedDims(
+  ArchRProj = projatac_filtered_with_RNA, 
+  reducedDims = c("Harmony_ATAC", "Harmony_RNA"),  # Your Harmony dimensions
+  name = "Harmony_combined"  # Name for the combined dimensions
+)
+```
+
+###Clustering for the combination of ATAC and RNA###
+```{r}
+# Rename the Column Names of the Combined Reduced Dimensions Before running the addClusters function, rename the column names of the reduced dimensions as suggested. This is important to be able to run addClusters with the combination of ATAC and RNA
+colnames(projatac_filtered_with_RNA@reducedDims$Harmony_combined$matRD) <- paste0(
+  'Harmony', 1:length(colnames(getReducedDims(projatac_filtered_with_RNA, 'Harmony_combined')))
+)
+
+# Add clusters for combined Harmony
+projatac_filtered_with_RNA <- addClusters(
+  input = projatac_filtered_with_RNA, 
+  reducedDims = "Harmony_combined", 
+  name = "combined_ham_clusters",  
+  method = "Seurat", 
+  resolution = 3, 
+  force = TRUE, 
+  maxClusters = 80
+)
+```
+
+
+```{r}
+#COMBINED
+# Define the colors you want to use
+pal_sample <- c(
+  "P8-nonsonicated" = "#ef6a32",
+  "P8-sonicated" = "#ed0345",
+  "P10-nonsonicated" = "#710162",
+  "P10-sonicated" = "#3B9AB2"
+)
+
+pal_sonivsnonsoni <- c(
+  "Sonicated" = '#542788', 
+  "Non-sonicated" = "#00BCD4")
+
+
+# Run UMAP on the combined Harmony dimensions
+projatac_filtered_with_RNA <- addUMAP(
+  ArchRProj = projatac_filtered_with_RNA, 
+  reducedDims = "Harmony_combined",  # Use combined Harmony dimensions
+  name = "UMAP_Harmony_combined", 
+  nNeighbors = 55, 
+  minDist = 0.8, 
+  metric = "cosine", 
+  force = TRUE, 
+  seed = 19
+)
+
+# Plot the UMAP for "Sample" metadata column without labels
+UMAP_Sample <- plotEmbedding(
+  ArchRProj = projatac_filtered_with_RNA, 
+  embedding = "UMAP_Harmony_combined", 
+  colorBy = "cellColData", 
+  keepAxis = FALSE,
+  name = "Sample",  # Use the "Sample" column
+  pal = pal_sample  # Apply the custom palette
+)
+
+
+# Plot the UMAP for "SonicationStatus" metadata column without labels
+UMAP_Sonication <- plotEmbedding(
+  ArchRProj = projatac_filtered_with_RNA, 
+  embedding = "UMAP_Harmony_combined", 
+  colorBy = "cellColData", 
+  name = "SonicationStatus",  # Single column name
+  pal = pal_sonivsnonsoni  # Custom colors
+)
+
+
+# Remove all text layers (layers 2 to 18 as they include text mappings)
+UMAP_Sample$layers <- UMAP_Sample$layers[-(2:18)]
+UMAP_Sonication$layers <- UMAP_Sonication$layers[-(2:18)]
+
+
+
+# Re-plot the UMAP without the labels
+#Extended Data Figure 7a
+print(UMAP_Sonication)
+print(UMAP_Sample)
+
+```
+
+
+

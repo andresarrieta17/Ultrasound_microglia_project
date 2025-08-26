@@ -1,0 +1,593 @@
+---
+title: "10. Microglia_pseudotime_analysis"
+author: "Victor A. Arrieta"
+date: "2025-08-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(ArchR)
+library(SummarizedExperiment)
+library(randomForest)
+library(caret)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+```
+
+# Create a cellular trajectory from non-sonicated to sonicated microglia.
+```{r}
+#To determine the vector to calculate the trajectory
+trajectory <- c("Non-sonicated", "Sonicated")
+
+microglia <- addTrajectory(
+    ArchRProj = microglia, 
+    name = "Microglia_sonication", 
+    groupBy = "SonicationStatus",
+    trajectory = trajectory, 
+    embedding = "UMAP_Harmony_microglia_combined", 
+    force = TRUE
+)
+
+head(microglia$Microglia_sonication[!is.na(microglia$Microglia_sonication)])
+
+```
+
+# Figure 4f
+```{r}
+p <- plotTrajectory(
+  ArchRProj = microglia,
+  trajectory = "Microglia_sonication",
+  embedding = "UMAP_Harmony_microglia_combined",
+  colorBy   = "cellColData",
+  size = 4,
+  plotAs = "points",
+  smoothWindow = 8,
+  baseSize = 10,
+  name      = "Microglia_sonication"      # or whatever column in cellColData holds your sonication labels
+)
+
+# p is a list of two ggplot objects
+print(p[[1]])  # the embedding colored by pseudotime
+print(p[[2]])  # the smoothed trajectory plot
+
+```
+
+#Trajectory analysis using the chromatin information
+```{r}
+trajGSM <- getTrajectory(ArchRProj = microglia, name = "Microglia_sonication", useMatrix = "GeneScoreMatrix", log2Norm = TRUE, trajectoryLabel = "SonicationStatus")
+```
+
+#To generate the heatmap with gene score (chromatin)
+#Figure 4g
+```{r}
+#Add impute weights before running this code
+p2 <- plotTrajectoryHeatmap(trajGSM, 
+                            pal = paletteContinuous(set = "horizonExtra"), 
+                            colorColumns = TRUE, 
+                            labelTop = 50,
+columnPal = pal_sonivsnonsoni)
+
+p2
+```
+
+#To run a machine-learning classifier to determine the most important features for Figure 4h, i, j, and Extended Data Figure 8
+```{r}
+# 1) Get your 424 ATAC marker genes
+atacGenes <- unique(unlist(lapply(
+  getMarkers(
+    ATAC_features_sonication,
+    cutOff = "FDR <= 0.01 & Log2FC >= 0.1"
+  ),
+  `[[`, "name"
+)))
+
+# 2) Extract the smoothed pseudotime matrix from trajGSM
+mat_full <- assay(trajGSM, "smoothMat")
+
+# 3) Map genomic-feature rownames → gene symbols
+gene_map <- rowData(trajGSM)$name
+names(gene_map) <- rownames(trajGSM)
+mapped_genes <- gene_map[rownames(mat_full)]
+
+# Drop any rows that failed to map
+valid_idx <- !is.na(mapped_genes)
+mat_full <- mat_full[valid_idx, , drop = FALSE]
+rownames(mat_full) <- mapped_genes[valid_idx]
+
+# 4) Subset to your significant ATAC genes
+mat_sig <- mat_full[rownames(mat_full) %in% atacGenes, , drop = FALSE]
+
+# 5) Build the ML data frame: pseudotime bins as rows, genes as columns
+df_ml <- as.data.frame(t(mat_sig))
+# Add the sonication label for each bin
+df_ml$label <- factor(colData(trajGSM)$label)  # “Non-sonicated” / “Sonicated”
+
+# 1) Make valid R names (hyphens → dots, etc.)
+colnames(df_ml) <- make.names(colnames(df_ml))
+
+# 2) Re-run the formula interface
+set.seed(33)
+
+# 1) Prepare your data frame (as before):
+#    df_ml has one row per pseudotime bin, columns = 424 genes + “label”
+#    Make sure rownames(df_ml) are unique or drop them.
+
+# 2) Set up 5-fold CV
+# turn “Non‐sonicated” → “Non_sonicated”
+df_ml$label <- as.character(df_ml$label)
+df_ml$label <- gsub("-", "_", df_ml$label)
+df_ml$label <- factor(df_ml$label)
+# now levels(df_ml$label) are “Non_sonicated” and “Sonicated”
+
+# set up 5‐fold CV (no hyphens here!)
+ctrl <- caret::trainControl(
+  method = "cv",
+  number = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+# fit
+rf_cv <- caret::train(
+  x         = df_ml[, setdiff(names(df_ml), "label")],
+  y         = df_ml$label,
+  method    = "rf",
+  metric    = "ROC",           # with twoClassSummary use ROC
+  trControl = ctrl,
+  ntree     = 500
+)
+
+# examine CV performance & importances
+print(rf_cv)
+plot(rf_cv)
+caret::varImp(rf_cv)         # aggregated importance across folds
+
+```
+
+#To plot the most important features in a bar plot
+#Extended Data Figure 8
+```{r}
+# 1) Extract and tidy the importance scores
+imp <- varImp(rf_cv)$importance
+imp_df <- imp %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(Overall))
+
+# 2) Select the top 20 genes
+top20 <- imp_df %>% slice_head(n = 20)
+
+# 3) Plot a horizontal bar‐plot with Helvetica font in black and a descriptive title
+ggplot(top20, aes(x = reorder(gene, Overall), y = Overall)) +
+  geom_col(fill = "#542788") +
+  coord_flip() +
+  labs(
+    x     = "Gene",
+    y     = "Variable Importance (Mean Decrease in Accuracy)",
+    title = "Top 20 Pseudotime-Dynamic Genes\nPredicting Microglial Sonication State"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    text            = element_text(family = "Helvetica", color = "black"),
+    axis.text       = element_text(color = "black"),
+    axis.title.x    = element_text(color = "black", size = 12),
+    axis.title.y    = element_text(color = "black", size = 12),
+    plot.title      = element_text(color = "black", size = 13, face = "plain", hjust = 0.5),
+    axis.line.x     = element_line(size = 0.3),   # make x‐axis line thinner
+    axis.line.y     = element_line(size = 0.3)    # make y‐axis line thinner
+  )
+```
+
+
+#Extended Data Figure 8
+```{r}
+# 1) Identify the top 5 predictive genes
+top5 <- top20$gene[1:6]
+
+# 2) Build a long‐format data.frame of their smoothed trajectories
+bins <- seq_len(ncol(mat_sig))
+traj_df <- data.frame(
+  pseudotime_bin = rep(bins, times = length(top5)),
+  gene           = factor(rep(top5, each = length(bins)), levels = top5),
+  accessibility  = as.vector(t(mat_sig[top5, , drop = FALSE]))
+)
+
+# Assuming traj_df and top5 are already defined…
+
+ggplot(traj_df, aes(x = pseudotime_bin, y = accessibility, color = gene)) +
+  geom_line(size = 1.2) +
+  
+  # 1) Use your custom five‐color palette (in the order of top5)
+  scale_color_manual(values = c(
+    "#371377",  # for top5[1]
+    "#7700FF",  # for top5[2]
+    "#FF0080",  # for top5[3]
+    "#FAD510",  # for top5[4]
+    "#00d4ff",   # for top5[5]
+    "#046C9A"   # for top6[6]
+  )) +
+  
+  labs(
+    x     = "Pseudotime Bin",
+    y     = "Smoothed Accessibility (z-score)",
+    title = "Dynamic Accessibility Trajectories\nof the Top 5 Predictive Genes"
+  ) +
+  
+  theme_classic(base_size = 14) +
+  theme(
+    text            = element_text(family = "Helvetica", color = "black"),
+    axis.text       = element_text(color = "black"),
+    axis.title      = element_text(color = "black"),
+    
+    # 2) Decrease the title font size to 10
+    plot.title      = element_text(
+                         family = "Helvetica",
+                         size   = 14,
+                         color  = "black",
+                         face   = "plain",
+                         hjust  = 0.5
+                      ),
+    
+    # keep axes lines thin
+    axis.line.x     = element_line(size = 0.3),
+    axis.line.y     = element_line(size = 0.3),
+    
+    # legend styling
+    legend.title    = element_blank(),
+    legend.text     = element_text(color = "black", size = 12)
+  )
+```
+
+
+#To generate UMAP plots for specific genes regarding gene scores (chromatin)
+#Figure 4h,i,j
+```{r}
+p1 <- plotTrajectory(microglia, 
+                     trajectory = "Microglia_sonication", 
+                     colorBy = "GeneScoreMatrix", 
+                     name = "RAB7B", 
+                     continuousSet = "horizonExtra", 
+                     embedding = "UMAP_Harmony_microglia_combined", 
+                      baseSize = 10,
+                      plotAs = "points",
+                      size = 4
+                     )
+
+p1[[1]]
+p1[[2]]
+
+p2 <- plotTrajectory(microglia, 
+                     trajectory = "Microglia_sonication", 
+                     colorBy = "GeneScoreMatrix", 
+                     name = "SPP1", 
+                     continuousSet = "horizonExtra", 
+                     embedding = "UMAP_Harmony_microglia_combined", 
+                      baseSize = 10,
+                      plotAs = "points",
+                      size = 4
+                     )
+
+p2[[1]]
+p2[[2]]
+
+p3 <- plotTrajectory(microglia, 
+                     trajectory = "Microglia_sonication", 
+                     colorBy = "GeneScoreMatrix", 
+                     name = "PDCD1", 
+                     continuousSet = "horizonExtra", 
+                     embedding = "UMAP_Harmony_microglia_combined", 
+                      baseSize = 10,
+                      plotAs = "points",
+                      size = 4
+                     )
+
+p3[[1]]
+p3[[2]]
+```
+
+#To plot a heatmap with the most relevant transcription factors according the evolution of microglia in the context of microglia
+```{r}
+trajMM  <- getTrajectory(ArchRProj = microglia, name = "Microglia_sonication", useMatrix = "MotifMatrix", log2Norm = FALSE, trajectoryLabel = "SonicationStatus")
+
+trajMM
+```
+
+#Extended Data Figure 10a
+```{r}
+pal_sonivsnonsoni <- c(
+  "Sonicated" = '#542788', 
+  "Non-sonicated" = "#00BCD4")
+
+p1 <- plotTrajectoryHeatmap(trajMM, 
+                            pal = paletteContinuous(set = "solarExtra"), 
+                            colorColumns = TRUE, 
+                            labelTop = 30,
+columnPal = pal_sonivsnonsoni)
+
+p1
+```
+
+#To generate UMAP plots for specific genes regarding MotifMatrix for transcription factors (chromatin)
+#Figure 5c
+```{r}
+motifs <- getFeatures(microglia, useMatrix = "MotifMatrix")
+head(motifs, 10)
+
+# Add Impute Weights using Harmony combined dimensions
+microglia <- addImputeWeights(
+  ArchRProj = microglia,
+  reducedDims = "Harmony_microglia_combined"  # Ensure this matches your reduced dimensions name
+)
+
+p1 <- plotTrajectory(microglia, 
+                     trajectory = "Microglia_sonication", 
+                     colorBy = "MotifMatrix", 
+                     name = "deviations:FOS_137", #"deviations:JUNB_139","deviations:JUN_143"
+                     continuousSet = "solarExtra", 
+                     embedding = "UMAP_Harmony_microglia_combined", 
+                      baseSize = 10,
+                      plotAs = "points",
+                      size = 5
+                     )
+
+p1[[1]]
+p1[[2]]
+
+p2 <- plotTrajectory(microglia, 
+                     trajectory = "Microglia_sonication", 
+                     colorBy = "MotifMatrix", 
+                     name = "deviations:FOSL2_105", 
+                     continuousSet = "solarExtra", 
+                     embedding = "UMAP_Harmony_microglia_combined", 
+                      baseSize = 10,
+                      plotAs = "points",
+                      size = 5
+                     )
+
+p2[[1]]
+p2[[2]]
+
+p3 <- plotTrajectory(microglia, 
+                     trajectory = "Microglia_sonication", 
+                     colorBy = "MotifMatrix", 
+                     name = "deviations:JUNB_139", 
+                     continuousSet = "solarExtra", 
+                     embedding = "UMAP_Harmony_microglia_combined", 
+                      baseSize = 10,
+                      plotAs = "points",
+                      size = 5
+                     )
+
+p3[[1]]
+p3[[2]]
+```
+
+#To run a machine-learning classifier to determine the most important features for transcription factors for Extended Data Figure 10b and c
+```{r}
+# 1) Pull out the full per‐cell motif deviation matrix
+motif_SE <- getMatrixFromProject(
+  ArchRProj = microglia,
+  useMatrix  = "MotifMatrix"
+)
+
+# 2) Extract the z‐score assay (still sparse)
+z_mat <- assay(motif_SE, "z")   # 870 motifs × 2181 cells
+
+# 3) Convert to dense & build ML data.frame
+dense_z  <- as.matrix(z_mat)    # now a base R matrix
+df_cells <- as.data.frame(t(dense_z))  # each row = one cell, each col = one motif
+df_cells$label <- factor(
+  gsub("-", "_", colData(motif_SE)$SonicationStatus),
+  levels = c("Non_sonicated","Sonicated")
+)
+
+# (Then sanitize names, set up trainControl, and train your RF as before)
+colnames(df_cells) <- make.names(colnames(df_cells))
+
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  allowParallel   = FALSE
+)
+
+set.seed(33)
+rf_full <- train(
+  label ~ .,
+  data      = df_cells,
+  method    = "rf",
+  metric    = "ROC",
+  trControl = ctrl,
+  ntree     = 500,
+  importance = TRUE
+)
+
+# 7) Print CV performance
+print(rf_full)
+
+# ------------------------------------------------------------------------------
+# 8) Extract and tidy the variable importance scores
+imp_mat        <- varImp(rf_full)$importance
+importance_col <- colnames(imp_mat)[1]  # grab the first importance column
+
+imp_all <- imp_mat %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "Motif") %>%
+  rename(Importance = !!sym(importance_col)) %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = 20)
+
+# 9) Plot the top 20 TF motif importances
+ggplot(imp_all, aes(x = reorder(Motif, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    x     = "TF Motif",
+    y     = "Variable Importance\n(Mean Decrease in Accuracy)",
+    title = "Top 20 TF Motifs Predicting Sonication State (per cell)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    text       = element_text(family = "Helvetica", color = "black"),
+    axis.text  = element_text(color = "black"),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.line  = element_line(size = 0.3)
+  )
+```
+
+#This code builds a model using the 27 most enriched TFs to predict sonication state
+#Extended Data Figure 10b
+```{r}
+# ---------------------------------------------
+# 1) Build a data.frame of motif enrichment results
+df_enrich <- data.frame(
+  TF          = rownames(motifsUp_microglia),
+  mlog10Padj  = assay(motifsUp_microglia)[, 1]
+) %>%
+  mutate(
+    padj = 10^(-mlog10Padj)    # convert back to adjusted p-value
+  )
+
+# 2) Filter for significant TFs at padj ≤ 0.05
+sig_TFs <- df_enrich %>%
+  filter(padj <= 0.05) %>%
+  pull(TF)
+
+
+# 4) Extract the smoothed motif‐deviation matrix
+mat_full_mm <- assay(trajMM, "smoothMat")
+
+# 5) Map internal rownames → TF names
+motif_map   <- rowData(trajMM)$name
+names(motif_map) <- rownames(trajMM)
+mapped_mm   <- motif_map[rownames(mat_full_mm)]
+valid_idx   <- !is.na(mapped_mm)
+mat_full_mm <- mat_full_mm[valid_idx, , drop = FALSE]
+rownames(mat_full_mm) <- mapped_mm[valid_idx]
+
+# 6) Subset to the significant TFs
+mat_sig_mm <- mat_full_mm[rownames(mat_full_mm) %in% sig_TFs, , drop = FALSE]
+
+# ---------------------------------------------
+# 7) Build the ML data.frame (bins × TFs)
+df_ml_mm <- as.data.frame(t(mat_sig_mm))
+df_ml_mm$label <- factor(
+  gsub("-", "_", colData(trajMM)$label), 
+  levels = c("Non_sonicated", "Sonicated")
+)
+
+# 8) Make column names valid R identifiers
+colnames(df_ml_mm) <- make.names(colnames(df_ml_mm))
+
+# ---------------------------------------------
+# 9) Set up 5-fold CV (serial to avoid seed issues)
+ctrl_tf <- trainControl(
+  method           = "cv",
+  number           = 5,
+  classProbs       = TRUE,
+  summaryFunction  = twoClassSummary,
+  allowParallel    = FALSE
+)
+
+# 10) Train the Random Forest
+set.seed(33)
+rf_tf <- train(
+  x          = df_ml_mm[, setdiff(names(df_ml_mm), "label")],
+  y          = df_ml_mm$label,
+  method     = "rf",
+  metric     = "ROC",
+  trControl  = ctrl_tf,
+  ntree      = 500,
+  importance = TRUE
+)
+
+# 11) Print cross‐validated performance
+print(rf_tf)
+
+# ---------------------------------------------
+# 12) Extract & tidy the importance scores
+imp_tf_mat <- varImp(rf_tf)$importance
+imp_tf_df  <- imp_tf_mat %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "TF") %>%
+  rename(Importance = !!colnames(imp_tf_mat)[1]) %>%
+  arrange(desc(Importance))
+
+# 13) Plot the top 20 TF motif importances
+top20_tf <- imp_tf_df %>% slice_head(n = 20)
+
+ggplot(top20_tf, aes(x = reorder(TF, Importance), y = Importance)) +
+  geom_col(fill = "#542788") +
+  coord_flip() +
+  labs(
+    x     = "Transcription Factor Motif",
+    y     = "Variable Importance (Mean Decrease in Accuracy)",
+    title = "Top 20 Enriched TF Motifs\nPredicting Microglial Sonication State"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    text            = element_text(family = "Helvetica", color = "black"),
+    axis.text       = element_text(color = "black"),
+    axis.title.x    = element_text(color = "black", size = 12),
+    axis.title.y    = element_text(color = "black", size = 12),
+    plot.title      = element_text(color = "black", size = 13, face = "plain", hjust = 0.5),
+    axis.line.x     = element_line(size = 0.3),   # make x‐axis line thinner
+    axis.line.y     = element_line(size = 0.3)    # make y‐axis line thinner
+  )
+
+```
+
+#Extended Data Figure 10c
+```{r}
+# 1) Identify the top 5 predictive TF motifs
+top5 <- top20_tf$TF[1:6]
+
+# 2) Build a long‐format data.frame of their smoothed trajectories
+#    (mat_sig_mm: rows = motifs, cols = pseudotime bins)
+bins   <- seq_len(ncol(mat_sig_mm))
+traj_df <- data.frame(
+  pseudotime_bin = rep(bins, times = length(top5)),
+  TF             = factor(rep(top5, each = length(bins)), levels = top5),
+  accessibility  = as.vector(t(mat_sig_mm[top5, , drop = FALSE]))
+)
+
+# 3) Plot with your five‐color palette
+ggplot(traj_df, aes(x = pseudotime_bin, y = accessibility, color = TF)) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = c(
+    "#371377",  # for top5[1]
+    "#7700FF",  # for top5[2]
+    "#FF0080",  # for top5[3]
+    "#FAD510",  # for top5[4]
+    "#00d4ff",   # for top5[5]
+    "#046C9A"   # for top5[5]
+  )) +
+  labs(
+    x     = "Pseudotime Bin",
+    y     = "Smoothed Motif Deviation (z-score)",
+    title = "Dynamic Trajectories\nof Top 5 Predictive TF Motifs"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    text            = element_text(family = "Helvetica", color = "black"),
+    axis.text       = element_text(color = "black"),
+    axis.title      = element_text(color = "black"),
+    plot.title      = element_text(                # shrink title
+                         family = "Helvetica",
+                         size   = 12,
+                         color  = "black",
+                         face   = "plain",
+                         hjust  = 0.5
+                      ),
+    axis.line.x     = element_line(size = 0.3),
+    axis.line.y     = element_line(size = 0.3),
+    legend.title    = element_blank(),
+    legend.text     = element_text(color = "black", size = 12)
+  )
+
+```
+
+

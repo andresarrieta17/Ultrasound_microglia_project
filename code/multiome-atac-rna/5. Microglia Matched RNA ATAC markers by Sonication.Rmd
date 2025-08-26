@@ -1,0 +1,191 @@
+---
+title: "5. Microglia — Matched RNA/ATAC markers by Sonication"
+author: "Victor A. Arrieta"
+date: "2025-08-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+set.seed(33)
+
+suppressPackageStartupMessages({
+  library(ArchR)
+  library(ComplexHeatmap)
+  library(grid)        # unit()
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(scales)      # squish, if needed later
+})
+```
+
+```{r}
+# ── Load subset project ──────────────────────────────────────────────────────
+microglia <- readRDS("Microglia_multiome_with_embeddings.rds")
+
+RNA_features_sonication <- getMarkerFeatures(
+    ArchRProj = microglia,
+    groupBy = "SonicationStatus",  # Grouping by sonication status
+    bias = "log10(Gex_nUMI)",  # Consider relevant biases
+    useMatrix = "GeneExpressionMatrix",  # Use gene expression for markers
+    testMethod = "wilcoxon",  # Default test method,
+    maxCells = 1500
+)
+
+# Get marker features based on GeneScoreMatrix for ATAC, grouped by SonicationStatus
+ATAC_features_sonication <- getMarkerFeatures(
+    ArchRProj = microglia,
+    groupBy = "SonicationStatus",  # Grouping by sonication status
+    bias = c("TSSEnrichment", "log10(nFrags)"),  # Consider relevant biases
+    useMatrix = "GeneScoreMatrix",  # Use gene scores for markers
+    testMethod = "wilcoxon",  # Default test method
+    maxCells = 1500
+)
+```
+
+```{r}
+# 1) 58 genes present & significant in both assays
+rnaGenes  <- unique(unlist(lapply(
+               getMarkers(RNA_features_sonication,  cutOff = "FDR <= 0.01 & Log2FC >= 0.1"),
+               `[[`, "name"))) 
+atacGenes <- unique(unlist(lapply(
+               getMarkers(ATAC_features_sonication, cutOff = "FDR <= 0.01 & Log2FC >= 0.1"),
+               `[[`, "name"))) 
+commonGenes <- intersect(rnaGenes, atacGenes)         
+
+#  Re-order every SE so **Sonicated** column is first
+statusOrder <- c("Sonicated", "Non-sonicated")        
+
+RNA_features_sonication  <- RNA_features_sonication[,  statusOrder]
+ATAC_features_sonication <- ATAC_features_sonication[, statusOrder]   # <-- ❷
+
+# row indices of the 58 genes in the full SEs
+idx_RNA58  <- match(commonGenes, rowData(RNA_features_sonication)$name)
+idx_ATAC58 <- match(commonGenes, rowData(ATAC_features_sonication)$name)
+
+#  Build ordering:  Son-up → Non-up (same as before)
+logFC58 <- assay(RNA_features_sonication, "Log2FC")[idx_RNA58, statusOrder]
+rownames(logFC58) <- rowData(RNA_features_sonication)$name[idx_RNA58]
+
+delta   <- logFC58[, "Sonicated"] - logFC58[, "Non-sonicated"]
+
+sonUp <- rownames(logFC58)[delta >  0]
+nonUp <- rownames(logFC58)[delta <= 0]
+
+cluster_by <- function(g) {
+  if(length(g) < 2) return(g)
+  z <- t(scale(t(logFC58[g, ])))
+  g[hclust(dist(z))$order]
+}
+
+masterOrder <- c(cluster_by(sonUp), cluster_by(nonUp))
+stopifnot(length(masterOrder) == 58)
+
+idx_RNA_ord  <- match(masterOrder, rowData(RNA_features_sonication)$name)
+idx_ATAC_ord <- match(masterOrder, rowData(ATAC_features_sonication)$name)
+
+# ATAC panel (top)  – no row re-clustering
+ht_ATAC58 <- plotMarkerHeatmap(
+  seMarker          = ATAC_features_sonication,
+  subsetMarkers     = idx_ATAC_ord,
+  cutOff            = "FDR <= 1",        # tautology keeps pass-matrix 2-D
+  plotLog2FC        = TRUE,
+  scaleRows         = TRUE,
+  pal               = paletteContinuous("horizonExtra"),
+  nLabel            = 0, #Include 0 when pootting everything together
+  binaryClusterRows = FALSE,             # preserve masterOrder
+  clusterCols       = FALSE,
+  transpose         = TRUE,              # columns → rows
+  limits            = c(-2, 2)
+)
+
+ht_ATAC58@column_names_param$show       <- FALSE
+ht_ATAC58@row_names_param$gp            <- gpar(fontsize = 12)
+ht_ATAC58@matrix_legend_param$title_gp  <- gpar(fontsize = 12)
+ht_ATAC58@matrix_legend_param$labels_gp <- gpar(fontface="plain", fontsize=12)
+ht_ATAC58@matrix_legend_param$title     <- 
+  paste0("Gene score (ATAC)\nZ-score")
+
+# RNA panel (bottom) – same row order
+ht_RNA58 <- plotMarkerHeatmap(
+  seMarker          = RNA_features_sonication,
+  subsetMarkers     = idx_RNA_ord,
+  cutOff            = "FDR <= 1",
+  plotLog2FC        = TRUE,
+  scaleRows         = TRUE,
+  pal               = paletteContinuous("blueYellow"),
+  nLabel            = 40, #Include 0 when plotting everything together
+  binaryClusterRows = FALSE,
+  clusterCols       = FALSE,
+  transpose         = TRUE,
+  limits            = c(-7, 8)
+)
+
+ht_RNA58@column_names_param$show       <- FALSE
+ht_RNA58@row_names_param$gp            <- gpar(fontsize = 12)
+ht_RNA58@matrix_legend_param$title_gp  <- gpar(fontsize = 12)
+ht_RNA58@matrix_legend_param$labels_gp <- gpar(fontface="plain", fontsize=12)
+ht_RNA58@matrix_legend_param$title     <- 
+  paste0("Gene expression (RNA)\nZ-score")
+
+#  Stack:  ATAC (top)  then  RNA (bottom)
+pad <- unit(c(20,50,20,20), "mm")
+
+#Figure 4c
+draw(
+  ht_RNA58 %v% ht_ATAC58,
+  heatmap_legend_side    = "bottom",
+  annotation_legend_side = "bottom",
+  padding                = pad,
+  legend_gap             = unit(12,"mm")   # gap between multiple bars
+)
+# dev.off()
+
+```
+
+
+#To plot the differentially accessible genes
+For Gene Score Matrix (ATAC):
+```{r}
+# ------------------------------------------------------------
+# 6) ATAC heatmap (Log2FC, same column order)
+heatmap_ATAC_sonication <- plotMarkerHeatmap(
+  seMarker          = ATAC_features_sonication,
+  cutOff            = "FDR <= 0.01 & Log2FC >= 0.1",
+  plotLog2FC        = TRUE,
+  scaleRows         = TRUE,
+  pal               = paletteContinuous("horizonExtra"),
+  nLabel            = 30,
+  binaryClusterRows = TRUE,
+  transpose         = TRUE,
+  limits            = c(-2, 2)
+)
+
+## change the font size for Sonicated and Non-sonicated
+heatmap_ATAC_sonication@column_names_param$show <- FALSE   # same for ATAC
+heatmap_ATAC_sonication@row_names_param$gp  <- gpar(fontsize = 14)
+
+## change legend title and label font to plain
+heatmap_ATAC_sonication@matrix_legend_param$title_gp  <- 
+  gpar(fontface = "plain", fontsize = 12)
+
+#For the numbers in the z score scale
+heatmap_ATAC_sonication@matrix_legend_param$labels_gp <- 
+  gpar(fontface = "plain", fontsize = 12)
+
+## change the legend title only
+heatmap_ATAC_sonication@matrix_legend_param$title <- "Gene score\ncolumn Z-score\n424 features"
+
+pad <- unit(c(10,20,20,20), "mm")
+
+# Extended Data Figure 7d
+#To plot the heat map
+draw(heatmap_ATAC_sonication,
+     heatmap_legend_side    = "bottom",
+     annotation_legend_side = "bottom",
+       padding                = pad)              # ← extra space around the plot
+
+dev.off()
+```

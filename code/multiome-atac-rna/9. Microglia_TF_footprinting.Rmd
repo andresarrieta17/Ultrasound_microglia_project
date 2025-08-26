@@ -1,0 +1,68 @@
+---
+title: "9. Microglia_TF_footprinting"
+author: "Victor A. Arrieta"
+date: "2025-08-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+motifPositions <- getPositions(microglia)
+motifPositions
+```
+
+```{r}
+motifs <- c("FOSL2", "JUNB", "FOS")
+markerMotifs <- unlist(lapply(motifs, function(x) grep(x, names(motifPositions), value = TRUE)))
+markerMotifs
+```
+
+Cells are grouped to create pseudo-bulk ATAC-seq profiles that can be then used for TF footprinting. These pseudo-bulk profiles are stored as group coverage files which we originally created in a previous chapter to perform peak calling. If you haven’t already added group coverages to your ArchRProject, run that first.
+```{r}
+if(is.null(microglia@projectMetadata$GroupCoverages$SonicationStatus$coverageMetadata)){
+  microglia <- addGroupCoverages(
+  ArchRProj = microglia,
+  groupBy = "SonicationStatus"
+)
+}
+
+```
+
+With group coverages calculated, we can now compute footprints for the subset of marker motifs that we previously selected using the getFootprints() function. Even though ArchR implements a highly optimized footprinting workflow, it is recommended to perform footprinting on a subset of motifs rather than all motifs.
+```{r}
+seFoot <- getFootprints(
+  ArchRProj = microglia,
+  positions  = motifPositions[markerMotifs],
+  groupBy    = "SonicationStatus",
+  minCells   = 500,       # require ≥50 cells per group
+  nTop       = 200       # only the top 200 motif sites
+)
+
+```
+
+#Figure 5c
+```{r}
+pal_sonivsnonsoni <- c(
+  "Sonicated" = '#542788', 
+  "Non-sonicated" = "#00BCD4")
+
+
+#I am using this for the figure
+# Plot with a "divide" normalization and smoothing
+plotFootprints(
+  seFoot      = seFoot,
+  pal         = pal_sonivsnonsoni, 
+  flank       = 250,                    # how many bp on each side
+  flankNorm   = 50,                     # bp window used for norm baseline
+  normMethod  = "Divide",             # normalization method
+  smoothWindow= 10,                     # smooth over 11 bp
+  baseSize    = 8,                      # bump up font size for axes/labels
+  plotName    = "TF_Footprint_Divide_smooth11",
+  height      = 5,
+  width       = 3,
+  addDOC      = FALSE
+)
+```
+
+

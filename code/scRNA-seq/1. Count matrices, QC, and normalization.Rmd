@@ -1,0 +1,206 @@
+---
+title: "1. Count matrices, QC, and normalization"
+author: "Victor A. Arrieta"
+date: "2025-08-24"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+set.seed(33)
+
+library(Seurat)
+library(dplyr)
+library(patchwork)
+```
+
+Import data and create Seurat objects
+```{r}
+# Paths to data (10x 'filtered_feature_bc_matrix' directories)
+ctrl_paths <- list(
+  "004-033_nonsoni_filtered_feature_bc_matrix",
+  "104_nonsoni_filtered_feature_bc_matrix",
+  "105_nonsoni_filtered_feature_bc_matrix",
+  "107_nonsoni_filtered_feature_bc_matrix",
+  "108_nonsoni_filtered_feature_bc_matrix",
+  "109_nonsoni_filtered_feature_bc_matrix",
+  "111_nonsoni_filtered_feature_bc_matrix"
+)
+
+soni_paths <- list(
+  "004-033_soni_filtered_feature_bc_matrix",
+  "104_soni_filtered_feature_bc_matrix",
+  "105_soni_filtered_feature_bc_matrix",
+  "107_soni_filtered_feature_bc_matrix",
+  "108_soni_filtered_feature_bc_matrix",
+  "109_soni_filtered_feature_bc_matrix",
+  "111_soni_filtered_feature_bc_matrix"
+)
+
+# Patient IDs (same order as paths)
+nonsoni_patient_ids <- c(
+  "Non-sonicated_Patient_004",
+  "Non-sonicated_Patient_104",
+  "Non-sonicated_Patient_105",
+  "Non-sonicated_Patient_107",
+  "Non-sonicated_Patient_108",
+  "Non-sonicated_Patient_109",
+  "Non-sonicated_Patient_111"
+)
+
+soni_patient_ids <- c(
+  "Sonicated_Patient_004",
+  "Sonicated_Patient_104",
+  "Sonicated_Patient_105",
+  "Sonicated_Patient_107",
+  "Sonicated_Patient_108",
+  "Sonicated_Patient_109",
+  "Sonicated_Patient_111"
+)
+
+# Helper: create a Seurat object with metadata; checks path existence
+create_seurat_objects <- function(paths, project_name, patient_ids) {
+  stopifnot(length(paths) == length(patient_ids))
+  sonication_status_value <- ifelse(project_name == "Non-sonicated", "Non-sonication", "Sonication")
+
+  objs <- mapply(function(path, pid) {
+    if (!dir.exists(path)) {
+      warning("Skipping (path not found): ", path)
+      return(NULL)
+    }
+    so <- CreateSeuratObject(
+      counts = Read10X(path),
+      project = project_name,
+      min.cells = 100,
+      min.features = 200
+    )
+    so$patient_id <- pid
+    so$sonication_status <- sonication_status_value
+    so
+  }, paths, patient_ids, SIMPLIFY = FALSE)
+
+  # Drop any NULLs from missing paths
+  objs[!vapply(objs, is.null, logical(1))]
+}
+
+# Create Seurat objects
+nonsoni_objects <- create_seurat_objects(ctrl_paths, "Non-sonicated", nonsoni_patient_ids)
+soni_objects    <- create_seurat_objects(soni_paths, "Sonicated",     soni_patient_ids)
+
+# Quick peek at metadata
+if (length(nonsoni_objects)) head(nonsoni_objects[[1]]@meta.data, 5)
+if (length(soni_objects))    head(soni_objects[[1]]@meta.data,    5)
+
+```
+
+#Create and save .rds files in the current working directory
+```{r}
+# Non-sonicated
+for (i in seq_along(nonsoni_objects)) {
+  saveRDS(nonsoni_objects[[i]], paste0(nonsoni_patient_ids[i], ".rds"))
+}
+
+# Sonicated
+for (i in seq_along(soni_objects)) {
+  saveRDS(soni_objects[[i]], paste0(soni_patient_ids[i], ".rds"))
+}
+```
+
+# Reload saved .rds files
+```{r}
+rds_files <- list.files(pattern = "\\.rds$")
+
+# Read them all into a named list
+all_objects <- lapply(rds_files, readRDS)
+names(all_objects) <- sub("\\.rds$", "", rds_files)
+
+# Separate into non-sonicated and sonicated lists
+nonsoni_objects <- all_objects[grepl("^Non-sonicated", names(all_objects))]
+soni_objects    <- all_objects[grepl("^Sonicated", names(all_objects))]
+
+# Quick check
+print(names(nonsoni_objects))
+print(names(soni_objects))
+```
+
+#QC metrics
+```{r}
+# Add mitochondrial, ribosomal, and hemoglobin percentages
+calculate_qc_metrics <- function(seurat_objects) {
+  lapply(seurat_objects, function(so) {
+    so[["percent.mito"]] <- PercentageFeatureSet(so, pattern = "^MT-")
+    so[["percent.ribo"]] <- PercentageFeatureSet(so, pattern = "^RP[SL]")
+    so[["percent.hb"]]   <- PercentageFeatureSet(so, pattern = "^HB[^P]")
+    so
+  })
+}
+
+nonsoni_objects <- calculate_qc_metrics(nonsoni_objects)
+soni_objects    <- calculate_qc_metrics(soni_objects)
+
+if (length(nonsoni_objects)) head(nonsoni_objects[[1]]@meta.data, 5)
+if (length(soni_objects))    head(soni_objects[[1]]@meta.data,    5)
+
+```
+
+#QC metrics
+```{r}
+plot_qc_metrics <- function(seurat_objects) {
+  lapply(seurat_objects, function(so) {
+    vln <- VlnPlot(
+      so,
+      features = c("nFeature_RNA", "nCount_RNA", "percent.mito", "percent.ribo"),
+      pt.size = 0.01, ncol = 2
+    )
+    sc1 <- FeatureScatter(so, feature1 = "nCount_RNA",   feature2 = "percent.mito")
+    sc2 <- FeatureScatter(so, feature1 = "nCount_RNA",   feature2 = "nFeature_RNA")
+    list(vln = vln, scat = sc1 + sc2)
+  })
+}
+
+nonsoni_plots <- plot_qc_metrics(nonsoni_objects)
+soni_plots    <- plot_qc_metrics(soni_objects)
+
+# Display first sample plots from each group (optional)
+if (length(nonsoni_plots)) { print(nonsoni_plots[[1]]$vln); print(nonsoni_plots[[1]]$scat) }
+if (length(soni_plots))    { print(soni_plots[[1]]$vln);    print(soni_plots[[1]]$scat) }
+
+```
+
+#Filter low-quality cells
+```{r}
+filter_data <- function(seurat_objects,
+                        min_features = 200,
+                        max_features = 6500,
+                        max_percent_mito = 15) {
+  lapply(seurat_objects, function(so) {
+    subset(so, subset =
+             nFeature_RNA > min_features &
+             nFeature_RNA < max_features &
+             percent.mito  < max_percent_mito)
+  })
+}
+
+nonsoni_objects <- filter_data(nonsoni_objects)
+soni_objects    <- filter_data(soni_objects)
+```
+
+#Normalize with SCTransform
+```{r}
+run_sctransform <- function(seurat_objects) {
+  lapply(seurat_objects, function(so) {
+    SCTransform(
+      so,
+      vars.to.regress = c("percent.mito", "percent.ribo", "percent.hb"),
+      verbose = FALSE
+    )
+  })
+}
+
+nonsoni_objects <- run_sctransform(nonsoni_objects)
+soni_objects    <- run_sctransform(soni_objects)
+```
+

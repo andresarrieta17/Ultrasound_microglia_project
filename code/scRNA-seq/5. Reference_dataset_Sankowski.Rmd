@@ -1,0 +1,288 @@
+---
+title: "5. Reference_dataset_Sankowski"
+author: "Victor A. Arrieta"
+date: "2025-08-24"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+set.seed(33)
+
+library(Seurat)
+library(Azimuth)
+library(dplyr)
+library(ggplot2)
+library(ArchR)
+library(SingleR)
+library(scuttle) 
+library(SingleCellExperiment)  
+
+```
+
+```{r}
+# Load annotated integrated object (place file next to this Rmd or adjust path)
+integrated_data <- readRDS("integrated_data.rds")
+integrated_data_copy <- integrated_data
+```
+
+## Load control and GBM reference objects from Sankowski et al, Nature Medicine, 2023
+```{r}
+load("GSE245311_multimodal_harmony_integrated_controls.RData")  # provides refquery_merged
+load("GSE245311_multimodal_harmony_integrated_gb.RData")        # provides refquery_hm
+
+DimPlot(refquery_merged, reduction = "umap", label = TRUE)
+DimPlot(refquery_hm,     reduction = "umap", label = TRUE)
+
+```
+
+#To annotate the reference dataset using the author's code
+```{r}
+# Rename for convenience
+all <- refquery_merged; rm(refquery_merged)
+
+# Order clusters by mean scaled RNA expression
+order_clusters <- data.frame(seurat_clusters = all$seurat_clusters,
+                             row.names = rownames(all@meta.data)) %>%
+  bind_cols(as.data.frame(t(all[["RNA"]]@scale.data))) %>%
+  group_by(seurat_clusters) %>%
+  summarize_all(mean) %>%
+  as.data.frame()
+
+rownames(order_clusters) <- order_clusters$seurat_clusters
+order_clusters <- order_clusters$seurat_clusters[hclust(dist(order_clusters[,-1]))$order]
+
+# Custom level reordering
+levels(all) <- rev(order_clusters)[c(11:15, 10:1, 31:33, 16:30, 34:35)]
+all$seurat_clusters <- factor(all$seurat_clusters, levels = levels(all))
+
+# Adjust cell-type labels
+celltype_cor <- case_when(
+  all$seurat_clusters == "24" ~ "Neuroectodermal cells",
+  all$seurat_clusters == "18" & all$predicted.celltype == "Platelet" ~ "cDC2",
+  all$seurat_clusters %in% c("19","26") ~ "CAMs",
+  all$seurat_clusters %in% c("22") & all$compartment == "CP" ~ "Kolmer cells",
+  all$seurat_clusters %in% c("0","1","4","6","13","16","22","30") ~ "MG",
+  all$seurat_clusters %in% c("9") ~ "Class. Mono",
+  all$seurat_clusters %in% c("27") & all$predicted.celltype %in% c("HSPC") ~ "NK Proliferating",
+  all$seurat_clusters %in% c("28") & all$predicted.celltype %in% c("HSPC") ~ "pDC",
+  all$seurat_clusters %in% c("15","20","7","2") ~ "Class. Mono",
+  all$seurat_clusters %in% c("31","23") ~ "Non-Class. Mono",
+  all$predicted.celltype == "CD14 Mono" ~ "Class. Mono",
+  all$predicted.celltype == "CD16 Mono" ~ "Non-Class. Mono",
+  TRUE ~ all$predicted.celltype
+)
+names(celltype_cor) <- colnames(all)
+all$celltype_cor <- celltype_cor
+
+DimPlot(all, reduction = "umap", group.by = "celltype_cor",
+        label = TRUE, pt.size = 1, repel = TRUE) +
+  theme_void() + NoLegend() + labs(title = "")
+
+```
+
+#To annotate the GBM reference dataset from Sankowski R, et al, Nature Medicine, 2023 using the author's code
+```{r}
+# Rename for convenience
+gb <- refquery_hm; rm(refquery_hm)
+
+# Order clusters by mean scaled RNA expression
+order_clusters <- data.frame(seurat_clusters = gb$seurat_clusters,
+                             row.names = rownames(gb@meta.data)) %>%
+  bind_cols(as.data.frame(t(gb[["RNA"]]@scale.data))) %>%
+  group_by(seurat_clusters) %>%
+  summarize_all(mean) %>%
+  as.data.frame()
+
+rownames(order_clusters) <- order_clusters$seurat_clusters
+order_clusters <- order_clusters$seurat_clusters[hclust(dist(order_clusters[,-1]))$order]
+
+# Custom level reordering
+levels(gb) <- rev(order_clusters)[c(12, 14, 13, 15:30, 11:1)]
+
+# Adjust cell-type labels
+celltype_cor_gb <- case_when(
+  gb$seurat_clusters %in% c("19","29") ~ "Neuroectodermal",
+  gb$seurat_clusters %in% c("17") ~ "CAMs",
+  gb$seurat_clusters %in% c("3","7","11","14","16","0","12","1","5") ~ "MG",
+  gb$seurat_clusters %in% c("15","25","4") & gb$diagnosis == "GB" ~ "moTAMs",
+  gb$seurat_clusters %in% c("2") & gb$diagnosis == "GB" ~ "mgTAMs",
+  gb$seurat_clusters %in% c("8") ~ "Class. Mono",
+  gb$predicted.celltype == "CD14 Mono" ~ "Class. Mono",
+  gb$predicted.celltype == "CD16 Mono" & gb$seurat_clusters == "23" ~ "Non-Class. Mono",
+  TRUE ~ gb$predicted.celltype
+)
+names(celltype_cor_gb) <- colnames(gb)
+gb$celltype_cor_gb <- celltype_cor_gb
+
+DimPlot(gb, reduction = "umap", group.by = "celltype_cor_gb",
+        label = TRUE, pt.size = 1, repel = TRUE) +
+  theme_void() + NoLegend() + labs(title = "")
+
+```
+
+#To process the control and GBM reference dataset 
+```{r}
+# Increase memory cap if needed
+options(future.globals.maxSize = 50 * 1024^3)
+
+# Use RNA assay
+DefaultAssay(all) <- "RNA"
+DefaultAssay(gb)  <- "RNA"
+DefaultAssay(integrated_data_copy) <- "RNA"
+
+# Controls reference: build SCT + 'apca' + UMAP with model
+all <- SCTransform(all, assay = "RNA", verbose = TRUE)
+DefaultAssay(all) <- "SCT"
+all <- RunPCA(all, assay = "SCT", reduction.name = "apca", npcs = 30, verbose = TRUE)
+all <- RunUMAP(all, reduction = "apca", dims = 1:30, return.model = TRUE, verbose = TRUE)
+
+# GBM reference: build SCT + 'apca' + UMAP with model
+gb <- SCTransform(gb, assay = "RNA", verbose = TRUE)
+DefaultAssay(gb) <- "SCT"
+gb <- RunPCA(gb, assay = "SCT", reduction.name = "apca", npcs = 30, verbose = TRUE)
+gb <- RunUMAP(gb, reduction = "apca", dims = 1:30, return.model = TRUE, verbose = TRUE)
+
+# Save processed GBM reference (relative path)
+saveRDS(gb, file = "gb_Sankowski.rds")
+
+# Query: unify RNA layers → SCT → 'apca' → UMAP with model
+integrated_data_copy <- JoinLayers(object = integrated_data_copy, assay = "RNA")
+integrated_data_copy <- SCTransform(integrated_data_copy, assay = "RNA", verbose = TRUE)
+integrated_data_copy <- RunPCA(integrated_data_copy, assay = "SCT",
+                               reduction.name = "apca", npcs = 30, verbose = TRUE)
+integrated_data_copy <- RunUMAP(integrated_data_copy, reduction = "apca",
+                                dims = 1:30, return.model = TRUE, verbose = TRUE)
+
+```
+
+#To run Azimuth using the functions from the R script
+```{r}
+# Use helper functions for Azimuth mapping (place file next to this Rmd or adjust path)
+source("modified_azimuth_for_cell_annotation.R")
+
+DefaultAssay(integrated_data_copy) <- "SCT"
+
+# Map to controls
+integrated_data_copy <- RunAzimuth(
+  query = integrated_data_copy,
+  reference = all,
+  annotation.levels = "celltype_cor",
+  verbose = TRUE,
+  assay = "SCT"
+)
+
+# Map to GBM
+integrated_data_copy <- RunAzimuth(
+  query = integrated_data_copy,
+  reference = gb,
+  annotation.levels = "celltype_cor_gb",
+  verbose = TRUE,
+  assay = "SCT"
+)
+```
+
+#Transfer cell annotations from the Copy object to the Original object
+```{r}
+# Transfer predicted annotations from copy → original
+cols_all <- c("predicted.celltype_cor", "predicted.celltype_cor.score")
+cols_gb  <- c("predicted.celltype_cor_gb", "predicted.celltype_cor_gb.score")
+
+common_cells <- intersect(colnames(integrated_data), colnames(integrated_data_copy))
+
+for (colname in c(cols_all, cols_gb)) {
+  if (!colname %in% colnames(integrated_data_copy@meta.data)) next
+  if (!colname %in% colnames(integrated_data@meta.data)) integrated_data[[colname]] <- NA
+  integrated_data@meta.data[common_cells, colname] <- integrated_data_copy@meta.data[common_cells, colname]
+}
+
+```
+
+
+#SingleR annotation
+```{r}
+# Load the HumanPrimaryCellAtlasData from SingleR
+ref <- readRDS("hpca_se.rds")
+
+## Work on a copy so the original assays stay intact
+integrated_tmp <- integrated_data
+
+integrated_tmp <- JoinLayers(
+  object = integrated_tmp,
+  assay = "RNA"
+)
+
+## Convert the copy to a SingleCellExperiment
+sce <- as.SingleCellExperiment(integrated_tmp, assay = "RNA")
+
+sce <- logNormCounts(sce)   # adds a "logcounts" assay
+
+singleR_res <- SingleR(
+  test   = sce,
+  ref    = ref,
+  labels = ref$label.main      # now default assay.type = "logcounts" works
+)
+
+
+integrated_data$SingleR_label <- singleR_res$labels
+DimPlot(integrated_data, group.by = "SingleR_label", label = TRUE, repel = TRUE, raster=FALSE)
+
+#Verify annotation
+head(integrated_data@meta.data$SingleR_annotation)
+
+```
+
+
+#Extended Data Fig. 2a, b, c
+```{r}
+DefaultAssay(integrated_data) <- "integrated"
+
+color_sonivsnonsoni <- c("#00BCD4", '#542788')
+
+stallion2 = c("#D51F26","#272E6A","#208A42","#89288F","#F47D2B", "#FEE500","#8A9FD1","#C06CAB","#E6C2DC",
+               "#90D5E4", "#89C75F","#F37B7D","#9983BD","#D24B27","#3BBCA8", "#6E4B9E","#0C727C", "#7E1416","#D8A767", "#7DD06F", "#844081","#688EC1","#C17E73","#484125","#6CD3A7","#597873","#7B6FD0","#CF4A31", "#D0CD47","#722A2D","#CBC594","#D19EC4","#5A7E36", "#D4477D","#403552","#76D73C","#96CED5","#CE54D1","#C48736")
+
+#Extended Data Figure 2a
+# UMAP plot colored by sonication status
+DimPlot(integrated_data, reduction = "umap", group.by = "orig.ident", label = FALSE, cols = color_sonivsnonsoni, pt.size = 2)
+
+#Extended Data Figure 2b
+#To show a UMAP plot with intermixed dots from all patient sample cells
+# Extract UMAP embeddings
+all_umap_data <- FetchData(integrated_data, vars = c("umap_1", "umap_2", "patient_id"))
+
+# Shuffle rows randomly
+set.seed(33) # Ensure reproducibility
+all_umap_data <- all_umap_data[sample(nrow(all_umap_data)), ]
+
+
+ggplot(all_umap_data, aes(x = umap_1, y = umap_2, color = patient_id)) +
+  geom_point(alpha = 1, size = 0.1) +  # Adjust transparency and point size if needed
+  scale_color_manual(values = stallion2) +  # Apply custom colors
+  theme_minimal() +  # Set a clean theme
+  theme(
+    panel.grid = element_blank(),  # Remove grid lines
+    axis.line = element_line(),    # Keep axis lines
+    axis.ticks = element_blank(),  # Remove axis ticks
+    axis.text = element_blank()    # Remove axis text (optional)
+  )
+
+
+#Extendede Data Figrue 2c
+#Microlial markers
+FeaturePlot(integrated_data, features = "P2RY12", reduction = "umap", max.cutoff = "q90", pt.size = 0.1, raster=FALSE) + scale_color_gradientn(colors = colorRampPalette(ArchRPalettes$blueYellow)(256))
+FeaturePlot(integrated_data, features = "SLC2A5", reduction = "umap", max.cutoff = "q90", pt.size = 0.1, raster=FALSE) + scale_color_gradientn(colors = colorRampPalette(ArchRPalettes$blueYellow)(256))
+FeaturePlot(integrated_data, features = "CX3CR1", reduction = "umap", max.cutoff = "q90", pt.size = 0.1, raster=FALSE) + scale_color_gradientn(colors = colorRampPalette(ArchRPalettes$blueYellow)(256))
+FeaturePlot(integrated_data, features = "TMEM119", reduction = "umap", max.cutoff = "q90", pt.size = 0.1, raster=FALSE) + scale_color_gradientn(colors = colorRampPalette(ArchRPalettes$blueYellow)(256))
+
+#Macrophages markers
+FeaturePlot(integrated_data, features = "CD163", reduction = "umap", max.cutoff = "q90", pt.size = 0.1, raster=FALSE) + scale_color_gradientn(colors = colorRampPalette(ArchRPalettes$blueYellow)(256))
+FeaturePlot(integrated_data, features = "MRC1", reduction = "umap", max.cutoff = "q90", pt.size = 0.1, raster=FALSE) + scale_color_gradientn(colors = colorRampPalette(ArchRPalettes$blueYellow)(256))
+FeaturePlot(integrated_data, features = "SELENOP", reduction = "umap", max.cutoff = "q90", pt.size = 0.1, raster=FALSE) + scale_color_gradientn(colors = colorRampPalette(ArchRPalettes$blueYellow)(256))
+FeaturePlot(integrated_data, features = "ITGA4", reduction = "umap", max.cutoff = "q90", pt.size = 0.1, raster=FALSE) + scale_color_gradientn(colors = colorRampPalette(ArchRPalettes$blueYellow)(256))
+```
+
+
+

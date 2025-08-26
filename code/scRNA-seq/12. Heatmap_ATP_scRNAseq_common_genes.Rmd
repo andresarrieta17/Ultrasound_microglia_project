@@ -1,0 +1,357 @@
+---
+title: "14. Heat map with overalapping genes between ATP and sonication"
+author: "Victor A. Arrieta"
+date: "2025-08-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# Load necessary packages
+library(edgeR)
+library(limma)
+library(DESeq2)
+library(apeglm)
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(ArchR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(decoupleR)
+library(ggrepel)
+library(tibble)
+library(tidyr)  
+library(pheatmap)
+library(gridExtra)  
+library(readr)
+```
+
+
+```{r}
+# ========== 1) Read in the full CSV (counts + annotation) ==========
+# Assumes first column is Ensembl ID, then count columns, then annotation columns.
+full <- read.csv(
+  "ATP_microglia_gene_count.csv",
+  row.names         = 1,
+  check.names       = FALSE,
+  stringsAsFactors  = FALSE
+)
+
+# ========== 2) Extract raw count matrix (six samples) ==========
+count_cols <- c("MG_ATP2","MG_ATP3","MG_ATP4",
+                "MG_NT1","MG_NT2","MG_NT3")
+counts_bulk <- full[, count_cols]
+
+# Rename for compatibility with DESeq2 code below
+counts <- counts_bulk
+
+# ========== 3) Extract gene‐name annotation ==========
+# one symbol per Ensembl ID
+gene_anno <- full[, "gene_name", drop = FALSE]
+
+# ========== 4) Strip Ensembl version suffixes if present ==========
+rownames(counts)     <- sub("\\.[0-9]+$", "", rownames(counts))
+rownames(gene_anno) <- rownames(counts)
+
+# ========== 5) Build sample metadata ==========
+coldata <- data.frame(
+  condition = factor(
+    c("ATP","ATP","ATP","NT","NT","NT"),
+    levels = c("NT","ATP")
+  ),
+  row.names = count_cols
+)
+
+# ========== 6) Create DESeqDataSet and run DESeq2 ==========
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = coldata,
+  design    = ~ condition
+)
+
+# Pre-filter low counts
+keep <- rowSums(counts(dds)) >= 10
+dds  <- dds[keep, ]
+
+# Run the DESeq2 pipeline
+dds <- DESeq(dds, quiet = TRUE)
+
+# ========== 7) Shrink log₂ fold-changes ==========
+res <- lfcShrink(
+  dds,
+  coef  = "condition_ATP_vs_NT",
+  type  = "apeglm",
+  quiet = TRUE
+)
+
+# ========== 8) Order results and annotate ==========
+resOrdered <- res[order(res$padj), ]
+res_df     <- as.data.frame(resOrdered)
+res_df$ensembl_id <- rownames(res_df)
+
+# Merge in gene symbols
+res_annot <- merge(
+  x     = res_df,
+  y     = gene_anno,
+  by.x  = "ensembl_id",
+  by.y  = "row.names",
+  all.x = TRUE,
+  sort  = FALSE
+)
+
+# Reorder columns: gene_name, ensembl_id first
+res_final <- res_annot[, c(
+  "gene_name", "ensembl_id",
+  setdiff(colnames(res_annot), c("gene_name","ensembl_id"))
+)]
+
+# ========== 9) Compute a combined ranking score ==========
+res_final$score <- sign(res_final$log2FoldChange) * -log10(res_final$padj)
+
+
+cat("\nTop 10 DEGs (by padj):\n")
+print(head(res_final, 10))
+
+```
+
+```{r}
+# or, using readr from the tidyverse
+res_final <- read_csv("DESeq2_ATP_vs_NT_results_with_genes.csv")
+
+# Load sonication DE results
+deg_soni <- read.csv(
+  "DEG_results_sonicated_vs_nonsonicated_microglia.csv",
+  stringsAsFactors = FALSE
+)
+
+# Define up/down gene lists
+up_atp    <- res_final %>%
+  filter(log2FoldChange >  0, padj < 0.05) %>%
+  pull(gene_name)
+
+down_atp  <- res_final %>%
+  filter(log2FoldChange <  0, padj < 0.05) %>%
+  pull(gene_name)
+
+up_soni   <- deg_soni %>%
+  filter(logfoldchanges >  0, pvals_adj < 0.05) %>%
+  pull(gene)
+
+down_soni <- deg_soni %>%
+  filter(logfoldchanges <  0, pvals_adj < 0.05) %>%
+  pull(gene)
+
+# Identify common DEGs 
+common_up   <- intersect(up_atp,   up_soni)
+common_down <- intersect(down_atp, down_soni)
+common_genes <- c(common_up, common_down)
+
+
+# To generate csv files for common upregulated and downregulated genes
+up_df <- data.frame(
+  gene       = common_up,
+  regulation = "common_up",
+  stringsAsFactors = FALSE
+)
+down_df <- data.frame(
+  gene       = common_down,
+  regulation = "common_down",
+  stringsAsFactors = FALSE
+)
+
+# combine
+common_df <- rbind(up_df, down_df)
+
+
+# ── PART 1: BULK RNA‐seq (ATP vs NT) ────────────────────────────────────────
+
+# Map symbols → Ensembl IDs and subset counts 
+ensembl_bulk <- rownames(gene_anno)[ gene_anno$gene_name %in% common_genes ]
+genes_bulk   <- intersect(ensembl_bulk, rownames(counts))
+mat_bulk <- DESeq2::counts(dds)[genes_bulk, , drop = FALSE]
+rownames(mat_bulk) <- gene_anno[genes_bulk, "gene_name"]
+
+
+# Log2‐transform and Z-score across samples 
+mat_bulk_log <- log2(mat_bulk + 1)
+mat_bulk_z   <- t(scale(t(mat_bulk_log)))
+
+# Average Z-scores per condition 
+bulk_groups  <- coldata$condition
+mat_bulk_avg <- sapply(levels(bulk_groups), function(g) {
+  rowMeans(mat_bulk_z[, bulk_groups == g, drop = FALSE], na.rm = TRUE)
+})
+colnames(mat_bulk_avg) <- levels(bulk_groups)
+
+# Plot bulk heatmap
+pheatmap(
+  mat_bulk_avg,
+  color            = ArchR::paletteContinuous("blueYellow", 100),
+  scale            = "none",
+  cluster_rows     = TRUE,
+  cluster_cols     = FALSE,
+  show_rownames    = TRUE,
+  show_colnames    = TRUE,
+  annotation_col   = NULL,
+  annotation_legend= FALSE
+)
+
+
+# ── PART 2: PSEUDOBULK scRNA-seq (Sonication)
+
+# Build pseudobulk counts per patient (14 samples) 
+pb_counts <- AverageExpression(
+  Microglia_filtered,
+  group.by = "patient_id",
+  assay    = "RNA",
+  slot     = "counts",
+  fun      = sum
+)$RNA
+
+# Subset common DEGs and Z-score
+genes_sc <- intersect(common_genes, rownames(pb_counts))
+pb_sub   <- pb_counts[genes_sc, , drop = FALSE]
+pb_log   <- log2(pb_sub + 1)
+pb_z     <- t(scale(t(pb_log)))
+
+# Collapse into two group averages
+status    <- ifelse(grepl("Non-sonicated", colnames(pb_z)),
+                    "Non-sonication", "Sonication")
+group_lvls <- c("Non-sonication","Sonication")
+mat_sc_avg <- sapply(group_lvls, function(g) {
+  rowMeans(pb_z[, status == g, drop = FALSE], na.rm = TRUE)
+})
+colnames(mat_sc_avg) <- group_lvls
+
+# Plot pseudobulk heatmap
+pheatmap(
+  mat_sc_avg,
+  color            = ArchR::paletteContinuous("blueYellow", 100),
+  scale            = "none",
+  cluster_rows     = TRUE,
+  cluster_cols     = FALSE,
+  show_rownames    = TRUE,
+  show_colnames    = TRUE,
+  annotation_col   = NULL,
+  annotation_legend= FALSE
+)
+
+
+# ── PART 3: SIDE-BY-SIDE TWO-COLUMN HEATMAPS 
+
+# Order rows by ATP−NT difference
+diffs      <- mat_bulk_avg[, "ATP"] - mat_bulk_avg[, "NT"]
+gene_order <- names(sort(diffs, decreasing = TRUE))
+gene_order <- intersect(gene_order, rownames(mat_sc_avg))
+
+mat_bulk_ord <- mat_bulk_avg[ gene_order, , drop = FALSE ]
+mat_sc_ord   <- mat_sc_avg[  gene_order, , drop = FALSE ]
+
+# Prepare row labels (e.g. top 30)
+n_label   <- 30
+all_genes <- rownames(mat_bulk_ord)
+labels_row <- ifelse(seq_along(all_genes) <= n_label, all_genes, "")
+
+
+```
+
+
+```{r}
+# Plot each heatmap without clustering rows
+CELL_H <- 1.5
+CELL_W <- 30
+
+# Parameters
+n_label     <- 73                                       # how many genes to label
+marker_rows <- seq_len(n_label)                        # row indices 1:30
+marker_labs <- rownames(mat_bulk_ord)[marker_rows]     # their gene names
+
+# ─── Define blueYellow color scale from ArchR ─────────────────────────────
+pal    <- ArchR::paletteContinuous("blueYellow", 100)
+col_fun <- colorRamp2(
+  seq(
+    min(c(mat_bulk_ord, mat_sc_ord), na.rm = TRUE),
+    max(c(mat_bulk_ord, mat_sc_ord), na.rm = TRUE),
+    length.out = length(pal)
+  ),
+  pal
+)
+```
+
+
+```{r}
+#Extended Dagta Figure 11d
+
+# ─── Make sure these objects are in your environment: ──────────────────────
+# mat_bulk_ord, mat_sc_ord: ordered matrices (genes × 2 columns)
+# marker_rows, marker_labs: indices & names of the top N genes to label
+# col_fun: a blueYellow colorRamp2 scale you defined via ArchR::paletteContinuous()
+
+# Define a Helvetica/plain theme for all text 
+common_gp        <- gpar(fontfamily = "Helvetica", fontface = "plain")
+marker_labels_gp <- gpar(fontsize   = 10,
+                         fontfamily = "Helvetica",
+                         fontface   = "plain")
+
+# Heatmap 1: ATP vs NT
+ht1 <- Heatmap(
+  mat_bulk_ord,
+  name               = "Bulk Z-score",
+  col                = col_fun,
+  cluster_rows       = FALSE,
+  cluster_columns    = FALSE,
+  show_row_names     = FALSE,
+  show_column_names  = TRUE,
+  column_names_rot   = 45,
+  column_names_gp    = common_gp,
+  heatmap_legend_param = list(
+    title_gp  = common_gp,
+    labels_gp = common_gp
+  ),
+  left_annotation    = rowAnnotation(
+    Genes = anno_mark(
+      at        = marker_rows,
+      labels    = marker_labs,
+      labels_gp = marker_labels_gp
+    ),
+    annotation_name_gp = common_gp
+  )
+)
+
+# Heatmap 2: Non-sonication vs Sonication
+ht2 <- Heatmap(
+  mat_sc_ord,
+  name               = "Pseudobulk Z-score",
+  col                = col_fun,
+  cluster_rows       = FALSE,
+  cluster_columns    = FALSE,
+  show_row_names     = FALSE,
+  show_column_names  = TRUE,
+  column_names_rot   = 45,
+  column_names_gp    = common_gp,
+  heatmap_legend_param = list(
+    title_gp  = common_gp,
+    labels_gp = common_gp
+  ),
+  left_annotation    = rowAnnotation(
+    Genes = anno_mark(
+      at        = marker_rows,
+      labels    = marker_labs,
+      labels_gp = marker_labels_gp
+    ),
+    annotation_name_gp = common_gp
+  )
+)
+
+# Draw them side by side, sharing the legend
+draw(
+  ht1 + ht2,
+  merge_legends = TRUE,
+  heatmap_legend_side = "right"
+)
+```
+

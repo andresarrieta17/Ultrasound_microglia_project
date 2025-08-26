@@ -1,0 +1,700 @@
+---
+title: "11. ATP_microglia_analysis"
+author: "Victor A. Arrieta"
+date: "2025-08-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# Load necessary packages
+library(edgeR)
+library(limma)
+library(DESeq2)
+library(apeglm)
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(ArchR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(decoupleR)
+library(ggrepel)
+library(tibble)
+library(tidyr)  
+library(pheatmap)
+library(gridExtra)  
+library(readr)
+library(decoupleR)
+library(OmnipathR)
+```
+
+
+###ATP ANALYSIS###
+```{r}
+## ---- 1) read data ----------------------------------------------------------
+file <- "ATP_microglia_gene_count.csv"
+
+full <- read.csv(
+  file, row.names = 1,
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+
+## ---- 2) select count columns ----------------------------------------------
+count_cols <- c("MG_ATP2","MG_ATP3","MG_ATP4","MG_NT1","MG_NT2","MG_NT3")
+missing <- setdiff(count_cols, colnames(full))
+if (length(missing) > 0) {
+  stop("These count columns are missing in the CSV: ",
+       paste(missing, collapse = ", "))
+}
+
+count_mat <- as.matrix(full[, count_cols])
+
+## Optional: if your CSV already has a gene_name column, keep it for fallback
+if ("gene_name" %in% colnames(full)) {
+  gene_anno <- full["gene_name"]
+  # make Ensembl IDs versionless to match later mapping
+  rownames(gene_anno) <- sub("\\.[0-9]+$", "", rownames(gene_anno))
+}
+
+## ---- 3) rowname cleanup, zero-drop, integer storage ------------------------
+rownames(count_mat) <- sub("\\.[0-9]+$", "", rownames(count_mat))
+count_mat <- count_mat[rowSums(count_mat) > 0, ]
+storage.mode(count_mat) <- "integer"
+
+## ---- 4) sample metadata -----------------------------------------------------
+coldata <- data.frame(
+  condition = factor(c("ATP","ATP","ATP","NT","NT","NT"),
+                     levels = c("NT","ATP")),
+  row.names = colnames(count_mat)
+)
+
+## ---- 5) DESeqDataSet + prefilter -------------------------------------------
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat,
+  colData   = coldata,
+  design    = ~ condition
+)
+
+keep <- rowSums(counts(dds)) >= 10
+dds  <- dds[keep, ]
+
+## ---- 6) run DESeq2 ----------------------------------------------------------
+dds <- DESeq(dds, quiet = TRUE)
+
+## pick the right coefficient name for shrinkage
+coef_name <- "condition_ATP_vs_NT"
+if (!coef_name %in% resultsNames(dds)) {
+  cand <- grep("^condition_.*_vs_.*", resultsNames(dds), value = TRUE)
+  if (length(cand) == 0) {
+    stop("No condition coefficient found in resultsNames(dds). Got: ",
+         paste(resultsNames(dds), collapse = ", "))
+  }
+  coef_name <- cand[1]
+}
+
+## ---- 7) LFC shrinkage (apeglm) ---------------------------------------------
+res <- lfcShrink(dds, coef = coef_name, type = "apeglm", quiet = TRUE)
+
+## ---- 8) order, to data.frame, keep Ensembl IDs -----------------------------
+resOrdered <- res[order(res$padj), ]
+res_df <- as.data.frame(resOrdered)
+res_df$ensembl_id    <- rownames(res_df)
+res_df$ensembl_core  <- sub("\\.[0-9]+$", "", res_df$ensembl_id)
+
+## ---- 9) add gene symbols via org.Hs.eg.db, fallback to CSV gene_name -------
+sym_map <- AnnotationDbi::mapIds(
+  org.Hs.eg.db,
+  keys     = res_df$ensembl_core,
+  keytype  = "ENSEMBL",
+  column   = "SYMBOL",
+  multiVals = "first"
+)
+
+res_df$gene_name <- unname(sym_map[res_df$ensembl_core])
+
+if (exists("gene_anno")) {
+  hit <- is.na(res_df$gene_name) & res_df$ensembl_core %in% rownames(gene_anno)
+  res_df$gene_name[hit] <- gene_anno[res_df$ensembl_core[hit], 1]
+}
+
+## ---- 10) tidy columns, score, write ----------------------------------------
+# Keep everything, but put gene_name & ensembl_id first; drop helper column
+res_final <- res_df[, c("gene_name","ensembl_id",
+                        setdiff(names(res_df), c("gene_name","ensembl_id","ensembl_core")))]
+
+# Remove rows with NA padj before scoring
+res_final <- res_final[!is.na(res_final$padj), ]
+
+# Robust score: sign(LFC) * -log10(padj), guard against padj==0
+padj_nz <- pmax(res_final$padj, .Machine$double.xmin)
+res_final$score <- sign(res_final$log2FoldChange) * -log10(padj_nz)
+
+write.csv(res_final,
+          file = "DESeq2_ATP_vs_NT_results_with_genes.csv",
+          row.names = FALSE, quote = FALSE)
+
+cat("\nTop 20 DEGs (by padj):\n")
+print(head(res_final, 20))
+```
+
+
+```{r}
+#To load the DEGs from ATP vs NT in vitro experiment in HMC3 cells
+res_final <- read_csv("DESeq2_ATP_vs_NT_results_with_genes.csv")
+
+## ─────────────────────────────────────────────────────────────────────────────
+## 1) Sonication DEGs (single-cell) from Microglia (scRNAseq)
+deg_results <- read.csv(
+  "DEG_results_sonicated_vs_nonsonicated_microglia.csv",
+  stringsAsFactors = FALSE
+)
+
+## Up in sonication / up in ATP (bulk)
+up_soni <- deg_results %>%
+  filter(logfoldchanges > 0, pvals_adj < 0.05) %>%
+  pull(gene) %>%
+  na.omit() %>%
+  unique()
+
+up_atp <- res_final %>%
+  filter(log2FoldChange > 0, padj < 0.05) %>%
+  pull(gene_name) %>%
+  na.omit() %>%
+  unique()
+
+## Build logical matrix for limma::vennCounts
+all_genes <- sort(union(up_atp, up_soni))
+venn_matrix <- data.frame(
+  ATP_up        = all_genes %in% up_atp,
+  Sonication_up = all_genes %in% up_soni,
+  row.names = all_genes
+)
+
+#Extended Data Figure 11c#
+## Venn counts and plot (with transparent circle colors)
+vc <- limma::vennCounts(venn_matrix)
+
+cols_up <- grDevices::adjustcolor(c("#ff3f0b", "#6A1B9A"), alpha.f = 0.5)
+limma::vennDiagram(
+  vc,
+  names      = c("ATP", "Sonication"),
+  circle.col = cols_up,
+  cex        = 1.2
+)
+
+## ─────────────────────────────────────────────────────────────────────────────
+## Down in sonication / down in ATP (bulk)
+down_soni <- deg_results %>%
+  filter(logfoldchanges < 0, pvals_adj < 0.05) %>%
+  pull(gene) %>%
+  na.omit() %>%
+  unique()
+
+down_atp <- res_final %>%
+  filter(log2FoldChange < 0, padj < 0.05) %>%
+  pull(gene_name) %>%
+  na.omit() %>%
+  unique()
+
+all_genes_down <- sort(union(down_atp, down_soni))
+venn_matrix_down <- data.frame(
+  ATP_down        = all_genes_down %in% down_atp,
+  Sonication_down = all_genes_down %in% down_soni,
+  row.names = all_genes_down
+)
+
+#Extended Data Figure 11c#
+vc_down <- limma::vennCounts(venn_matrix_down)
+
+cols_down <- grDevices::adjustcolor(c("#F8BA43", "#00BCD4"), alpha.f = 0.5)
+limma::vennDiagram(
+  vc_down,
+  names      = c("ATP", "Sonication"),
+  circle.col = cols_down,
+  cex        = 1.2
+)
+
+
+
+
+## ─────────────────────────────────────────────────────────────────────────────
+## ORA on commonly UP genes (for the figure)
+common_up <- intersect(up_atp, up_soni) %>% na.omit() %>% unique()
+cat("Common upregulated (n) =", length(common_up), "\n")
+
+## Universe: all tested symbols from both sources (drop NAs)
+universe_sym <- union(res_final$gene_name, deg_results$gene) %>% na.omit() %>% unique()
+
+
+
+# RUN ORA (enrichGO) ON THE COMMONLY UPREGULATED GENES
+ora_common_up <- enrichGO(
+  gene          = common_up,
+  universe      = universe_sym,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",            # Biological Process
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+# CONVERT ORA RESULTS TO A DATA FRAME AND WRAP TEXT  
+ora_common_up_df <- as.data.frame(ora_common_up)
+
+# (Optional) Inspect the top enriched terms
+head(ora_common_up_df)
+
+# Wrap long GO term descriptions so they display nicely
+wrapText <- function(x, len = 60) {
+  sapply(x, function(y) {
+    if (nchar(y) > len) {
+      gsub(paste0("(.{", len, "})"), "\\1\n", y, perl = TRUE)
+    } else {
+      y
+    }
+  }, USE.NAMES = FALSE)
+}
+
+ora_common_up_df <- ora_common_up_df %>%
+  mutate(
+    Term_wrapped = wrapText(Description, len = 60)
+  )
+
+# SELECT TOP ENRICHED TERMS BY ADJUSTED P‐VALUE 
+top_n <- 12
+
+top_common_up <- ora_common_up_df %>%
+  arrange(p.adjust) %>%
+  slice_head(n = top_n)
+
+
+# Print the top 12
+top_common_up
+
+
+# DOT PLOT FOR COMMONLY UPREGULATED GO:BP TERMS USING ggplot2  
+
+# Assume you have already run the ORA step and created 'ora_common_up_df'
+# with columns including: Description, Count, p.adjust, and Term_wrapped.
+
+# Prepare the data frame for plotting ---------------------------------------
+
+common_terms <- ora_common_up_df %>%
+  # No need to filter by Direction since this is only the “common” set
+  arrange(p.adjust) %>%                      # ascending p.adjust (most significant first)
+  slice_head(n = 12) %>%                     # keep top 10 terms
+  mutate(
+    Term_wrapped = factor(
+      Term_wrapped,
+      levels = rev(unique(Term_wrapped))     # so the most significant is on top
+    ),
+    Condition = "Common"                     # single category for x-axis
+  )
+
+# Compute the fill scale limits based on p.adjust 
+
+pmin <- min(common_terms$p.adjust)
+pmax <- max(common_terms$p.adjust)
+
+# Define a custom color palette 
+
+custom_pal <- c(
+  "#ff3f0b",
+  "#f56a35",
+  "#e79578",
+  "white",
+  "#a7d8ed",
+  "#1f96c5",
+  "#1e91c0"
+)
+
+#Extended Data Figure 11e
+# Build and render the dot plot
+
+p_common <- ggplot(common_terms, aes(x = Condition, y = Term_wrapped)) +
+  geom_point(
+    aes(size = Count, fill = p.adjust),
+    shape  = 21,
+    color  = "black",
+    stroke = 0.5
+  ) +
+  scale_fill_gradientn(
+    colours = custom_pal,
+    name    = "Adj. p-value",
+    limits  = c(pmin, pmax),
+    trans   = "log10",
+    oob     = scales::squish
+  ) +
+  scale_size_continuous(
+    range = c(5, 13),
+    name  = "Gene set size",
+    guide = guide_legend(
+      override.aes = list(fill = "black", color = "black")
+    )
+  ) +
+  labs(
+    x     = NULL,
+    y     = NULL
+  ) +
+  theme_minimal(base_family = "Helvetica") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(size = 0, colour = "black", angle = 30, hjust = 1),
+    axis.text.y      = element_text(size = 18, colour = "black"),
+    plot.title       = element_text(size = 16, face = "bold", colour = "black", hjust = 0.5),
+    legend.title     = element_text(size = 14, colour = "black"),
+    legend.text      = element_text(size = 14, colour = "black")
+  )
+
+print(p_common)
+
+
+
+
+
+# FIND COMMONLY DOWNREGULATED GENES 
+common_down <- intersect(down_atp, down_soni)
+length(common_down)
+
+# DEFINE BACKGROUND/UNIVERSE 
+universe_sym <- union(res_final$gene_name, deg_results$gene)
+
+# RUN ORA (enrichGO) FOR COMMON DOWNREGULATED GENES 
+
+ora_common_down <- enrichGO(
+  gene          = common_down,
+  universe      = universe_sym,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",            # Biological Process
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+# CONVERT ORA RESULTS TO DATA FRAME & WRAP LONG TERM NAMES
+
+ora_common_down_df <- as.data.frame(ora_common_down)
+
+wrapText <- function(x, len = 60) {
+  sapply(x, function(y) {
+    if (nchar(y) > len) {
+      gsub(paste0("(.{", len, "})"), "\\1\n", y, perl = TRUE)
+    } else {
+      y
+    }
+  }, USE.NAMES = FALSE)
+}
+
+ora_common_down_df <- ora_common_down_df %>%
+  mutate(Term_wrapped = wrapText(Description, len = 60))
+
+# SELECT TOP ENRICHED TERMS BY ADJUSTED P‐VALUE
+
+top_n <- 7
+
+top_common_down <- ora_common_down_df %>%
+  arrange(p.adjust) %>%
+  slice_head(n = top_n) %>%
+  mutate(
+    Term_wrapped = factor(
+      Term_wrapped,
+      levels = rev(unique(Term_wrapped))  # most significant at top
+    ),
+    Condition = "CommonDown"
+  )
+
+# COMPUTE FILL SCALE LIMITS BASED ON p.adjust 
+
+pmin_down <- min(top_common_down$p.adjust)
+pmax_down <- max(top_common_down$p.adjust)
+
+# DEFINE CUSTOM COLOR PALETTE
+
+custom_pal <- c(
+  "#ff3f0b",
+  "#f56a35",
+  "#e79578",
+  "white",
+  "#a7d8ed",
+  "#1f96c5",
+  "#1e91c0"
+)
+
+#Extended Data Figure 11e
+# BUILD AND RENDER THE DOT PLOT
+
+p_down <- ggplot(top_common_down, aes(x = Condition, y = Term_wrapped)) +
+  geom_point(
+    aes(size = Count, fill = p.adjust),
+    shape  = 21,
+    color  = "black",
+    stroke = 0.5
+  ) +
+  scale_fill_gradientn(
+    colours = custom_pal,
+    name    = "Adj. p-value",
+    limits  = c(pmin_down, pmax_down),
+    trans   = "log10",
+    oob     = scales::squish
+  ) +
+  scale_size_continuous(
+    range = c(5, 13),
+    name  = "Gene set size",
+    guide = guide_legend(
+      override.aes = list(fill = "black", color = "black")
+    )
+  ) +
+  labs(
+    x     = NULL,
+    y     = NULL,
+  ) +
+  theme_minimal(base_family = "Helvetica") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(size = 0, colour = "black", angle = 30, hjust = 1),
+    axis.text.y      = element_text(size = 18, colour = "black"),
+    plot.title       = element_text(size = 16, face = "bold", colour = "black", hjust = 0.5),
+    legend.title     = element_text(size = 14, colour = "black"),
+    legend.text      = element_text(size = 14, colour = "black")
+  )
+
+print(p_down)
+```
+
+# To INFER TRANSCRIPTION FACTORS DRIVING THE “COMMON” GENES VIA DecoupleR/UML.
+I am using this code for the figure
+```{r}
+# Read sonication DEGs and extract up/down lists
+deg_results <- read.csv(
+  "DEG_results_sonicated_vs_nonsonicated_microglia.csv",
+  stringsAsFactors = FALSE
+)
+
+up_soni   <- deg_results %>%
+  filter(logfoldchanges >  0, pvals_adj < 0.05) %>%
+  pull(gene)
+
+down_soni <- deg_results %>%
+  filter(logfoldchanges <  0, pvals_adj < 0.05) %>%
+  pull(gene)
+
+#  Read your DESeq2 results (`res_final`) and extract up/down lists
+#     (Assumes `res_final` is already in your environment with columns:
+#       gene_name, log2FoldChange, padj, score, etc.)
+up_atp   <- res_final %>%
+  filter(log2FoldChange >  0, padj < 0.05) %>%
+  pull(gene_name)
+
+down_atp <- res_final %>%
+  filter(log2FoldChange <  0, padj < 0.05) %>%
+  pull(gene_name)
+
+# Find the intersection (genes up in both, and genes down in both)
+common_up   <- intersect(up_atp,   up_soni)
+common_down <- intersect(down_atp, down_soni)
+
+# Combine into a single “common_genes” vector
+common_genes <- union(common_up, common_down)
+
+# EXTRACT SCT‐SCALED EXPRESSION FOR “COMMON” GENES
+
+# Ensure that the “SCT” assay is present
+DefaultAssay(Microglia_filtered) <- "SCT"
+
+# Extract the SCT‐scaled (Z‐scored) matrix (genes × cells)
+#     We will later subset rows to only `common_genes`
+all_scaled_mat <- as.matrix(
+  GetAssayData(Microglia_filtered, assay = "SCT", slot = "data")
+)
+
+# Subset to only common_genes (discard any that are not present)
+common_present <- intersect(common_genes, rownames(all_scaled_mat))
+if(length(common_genes) != length(common_present)) {
+  message(
+    "Dropped ", length(common_genes) - length(common_present),
+    " common genes not found in SCT: ",
+    paste(setdiff(common_genes, common_present), collapse = ", ")
+  )
+}
+mat_common <- all_scaled_mat[common_present, , drop = FALSE]
+
+# DOWNLOAD THE CollecTRI REGULATORY NETWORK  
+
+# 3A) This fetches the human regulatory network with TF→target weights from CollecTRI
+net <- get_collectri(
+  organism        = "human",
+  split_complexes = FALSE
+)
+# `net` is a tibble/data.frame with columns: source (TF), target (gene), mor (mode-of-regulation)
+
+# Subset `net` to only include edges where `target` is in common_present
+#     This speeds up the inference by removing irrelevant edges.
+net_common <- net %>%
+  filter(target %in% common_present)
+
+#  RUN THE ULM METHOD TO INFER TF ACTIVITIES  
+acts <- run_ulm(
+  mat     = mat_common,
+  net     = net_common,
+  .source = "source",
+  .target = "target",
+  .mor    = "mor",
+  minsize = 5      # only consider TFs with at least 5 targets in common_present
+)
+
+
+#  STORE TF ACTIVITIES IN A “tfsulm” ASSAY (OPTIONAL)
+
+# 5A) Pivot `acts` to make a matrix of TF-by-cell activities
+tf_by_cell <- acts %>%
+  dplyr::select(source, condition, score) %>%
+  pivot_wider(
+    names_from  = condition, 
+    values_from = score
+  ) %>%
+  column_to_rownames("source") %>%
+  as.matrix()
+
+# Create a new assay “tfsulm” in the Seurat object
+Microglia_filtered[["tfsulm"]] <- CreateAssayObject(tf_by_cell)
+
+# Make “tfsulm” the default assay and scale its data so the values become Z-scores
+DefaultAssay(Microglia_filtered) <- "tfsulm"
+Microglia_filtered <- ScaleData(
+  Microglia_filtered,
+  assay = "tfsulm",
+  features = rownames(tf_by_cell)
+)
+
+# COMPUTE MEAN TF ACTIVITY PER CONDITION & RANK TFs 
+
+# Choose `n_tfs` = number of top TFs you want in the barplot
+n_tfs <- 5
+
+# Extract the scaled TF activity matrix (TF × cells)
+tfs_mat <- GetAssayData(
+  Microglia_filtered, 
+  assay = "tfsulm", 
+  slot  = "data"
+)
+
+# Extract metadata: sonication status for each cell
+status <- Microglia_filtered$sonication_status
+# Check: should be exactly “Non-sonication” and “Sonication”
+unique(status)
+
+# Compute mean activity per TF in each condition
+mean_non_son <- rowMeans(
+  tfs_mat[ , status == "Non-sonication", drop = FALSE]
+)
+mean_son <- rowMeans(
+  tfs_mat[ , status == "Sonication", drop = FALSE]
+)
+
+# Compute the difference (Sonication – Non-sonication) for each TF
+diffs <- mean_son - mean_non_son
+
+# Create a data.frame for ranking
+tf_df <- tibble(
+  TF    = names(diffs),
+  diff  = diffs,
+  mean_son  = mean_son[TF],
+  mean_non  = mean_non_son[TF]
+)
+
+
+# column indices for each condition
+son_idx <- which(status == "Sonication")
+non_idx <- which(status == "Non-sonication")
+
+# helper: Wilcoxon p-value for one TF (row name)
+wilcox_p <- function(tf) {
+  x <- as.numeric(tfs_mat[tf, son_idx, drop = FALSE])  # ensure numeric vector
+  y <- as.numeric(tfs_mat[tf, non_idx, drop = FALSE])
+  x <- x[!is.na(x)]; y <- y[!is.na(y)]
+  if (length(x) < 2 || length(y) < 2) return(NA_real_)
+  suppressWarnings(wilcox.test(x, y)$p.value)
+}
+
+tf_df <- tf_df %>%
+  rowwise() %>%
+  mutate(pval = wilcox_p(TF)) %>%
+  ungroup() %>%
+  mutate(
+    pval_adj = p.adjust(pval, method = "BH"),
+    logp     = -log10(pmax(pval_adj, .Machine$double.xmin))
+  )
+
+
+# Categorize TFs by direction of activity
+tf_df <- tf_df %>%
+  mutate(
+    category = case_when(
+      diff >  0.05  & pval_adj < 0.05 ~ "Sonication↑",
+      diff < -0.05  & pval_adj < 0.05 ~ "Non-sonication↑",
+      TRUE                            ~ "Neutral"
+    ),
+    category = factor(category, levels = c("Non-sonication↑", "Neutral", "Sonication↑"))
+  )
+
+# Select top TFs by absolute difference (or you can choose by pval_adj)
+top_son_tf <- tf_df %>%
+  filter(category == "Sonication↑") %>%
+  arrange(desc(diff)) %>%
+  slice_head(n = n_tfs)
+
+top_non_tf <- tf_df %>%
+  filter(category == "Non-sonication↑") %>%
+  arrange(diff) %>%
+  slice_head(n = n_tfs)
+
+# 6J) Combine for the barplot, ordering by descending `diff`
+bar_df <- bind_rows(top_son_tf, top_non_tf) %>%
+  arrange(desc(diff)) %>%
+  mutate(
+    TF = factor(TF, levels = TF)  # freeze this order for plotting
+  )
+
+
+#Extended Data Figure 11f#
+
+# PLOT THE BAR CHART OF TOP TRANSCRIPTION FACTORS
+
+p_tf <- ggplot(bar_df, aes(x = TF, y = diff, fill = category)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(
+    name   = NULL,
+    values = c(
+      "Sonication↑"      = "#542788",
+      "Non-sonication↑"  = "#00BCD4",
+      "Neutral"          = "grey80"
+    )
+  ) +
+  labs(
+    x     = "Transcription Factor",
+    y     = "Mean Activity Difference\n(Sonicated − Non-sonicated)") +
+  theme_classic(base_family = "Helvetica") +
+  theme(
+    panel.grid       = element_blank(),
+    axis.text.x      = element_text(angle = 45, hjust = 1, colour = "black", size = 12),
+    axis.text.y      = element_text(colour = "black", size = 12),
+    axis.title       = element_text(colour = "black", size = 14),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position  = "right",
+    legend.text      = element_text(size = 12),
+    legend.key.size  = unit(0.5, "cm")
+  )
+
+print(p_tf)
+
+```
+
+
