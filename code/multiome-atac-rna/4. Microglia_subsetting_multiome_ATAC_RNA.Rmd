@@ -1,0 +1,240 @@
+---
+title: "4. Microglia_subset_multiome_ATAC_RNA"
+author: "Victor A. Arrieta"
+date: "2025-08-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(ArchR)
+library(dplyr)
+
+addArchRThreads(8)
+set.seed(33)
+```
+
+
+```{r}
+# Define the path for the subsets directory (ensure it's outside the original project.THIS IS IMPORTANT TO PREVENT AN INFINITE LOOP OF SUBSET DIRECTORY CREATION)
+# For example, create a separate 'Microglia_Subsets' directory at the same level as the main project
+subsets_dir <- "/projects/p30997/r_projects/Multiome_Microglia_Subset"
+
+# Create the subsets directory if it doesn't exist
+if (!dir.exists(subsets_dir)) {
+  dir.create(subsets_dir)
+}
+
+# Define the full path for the Microglia subset
+microglia_output_dir <- file.path(subsets_dir)
+
+```
+
+
+```{r}
+#########CAUTION!!!!!!!!
+# Check if the output directory already exists and handle accordingly. Take into account that if you run this line of code below, the folder will be overwritten.
+
+#if (dir.exists(microglia_output_dir)) {
+#  warning(paste("Output directory", microglia_output_dir, "already exists. It will be overwritten."))
+#  unlink(microglia_output_dir, recursive = TRUE)  # Remove existing directory}
+
+# Perform the subsetting with threads set to 8
+microglia <- subsetArchRProject(
+  ArchRProj = projatac_filtered_with_RNA,
+  cells = microglia_barcodes,
+  outputDirectory = microglia_output_dir,
+  threads = 8,      # Utilize all 8 cores
+  force = TRUE      # Overwrite if the directory exists
+)
+```
+
+```{r}
+# Reload to ensure a clean handle
+microglia <- loadArchRProject(microglia_output_dir)
+
+message("Microglia cells: ", nCells(microglia))
+# head(microglia@cellColData)
+
+# ── Quick matrix checks ─────────────────────────────────────────────────────
+avail <- getAvailableMatrices(microglia)
+if (!"TileMatrix" %in% avail) stop("TileMatrix missing in subset.")
+if (!"GeneExpressionMatrix" %in% avail)
+  stop("GeneExpressionMatrix missing in subset. Re-run addGeneExpressionMatrix on the parent before subsetting.")
+```
+
+```{r}
+# ── LSI on ATAC & RNA ───────────────────────────────────────────────────────
+microglia <- addIterativeLSI(
+  ArchRProj     = microglia,
+  useMatrix     = "TileMatrix",
+  name          = "LSI_microglia_atac",
+  iterations    = 2,
+  clusterParams = list(resolution = 2, sampleCells = 5000, maxClusters = 10),
+  varFeatures   = 30000,
+  dimsToUse     = 1:30,
+  LSIMethod     = 2,
+  force         = TRUE
+)
+
+
+microglia <- addIterativeLSI(
+  ArchRProj     = microglia,
+  useMatrix     = "GeneExpressionMatrix",
+  name          = "LSI_microglia_rna",
+  iterations    = 2,
+  clusterParams = list(resolution = 2, sampleCells = 5000, maxClusters = 10),
+  varFeatures   = 2000,
+  dimsToUse     = 1:30,
+  LSIMethod     = 2,
+  depthCol      = "Gex_nUMI",
+  force         = TRUE
+)
+```
+
+
+```{r}
+# ── Harmony batch correction ────────────────────────────────────────────────
+# Ensure 'Sample' exists; if not, derive from cell name prefix before '#'
+if (!"Sample" %in% colnames(microglia@cellColData)) {
+  samp <- sub("#.*", "", rownames(microglia@cellColData))
+  microglia$Sample <- samp
+}
+table(microglia$Sample)
+
+microglia <- addHarmony(
+  ArchRProj   = microglia,
+  reducedDims = "LSI_microglia_atac",
+  name        = "Harmony_microglia_atac",
+  groupBy     = "Sample",
+  force       = TRUE
+)
+
+microglia <- addHarmony(
+  ArchRProj   = microglia,
+  reducedDims = "LSI_microglia_rna",
+  name        = "Harmony_microglia_rna",
+  groupBy     = "Sample",
+  force       = TRUE
+)
+```
+
+```{r}
+# ── Clustering on Harmony embeddings ────────────────────────────────────────
+microglia <- addClusters(
+  input       = microglia,
+  reducedDims = "Harmony_microglia_atac",
+  name        = "clusters_microglia_atac",
+  method      = "Seurat",
+  resolution  = 3,
+  force       = TRUE
+)
+
+microglia <- addClusters(
+  input       = microglia,
+  reducedDims = "Harmony_microglia_rna",
+  name        = "clusters_microglia_rna",
+  method      = "Seurat",
+  resolution  = 3,
+  force       = TRUE
+)
+
+# ── UMAPs for ATAC & RNA ────────────────────────────────────────────────────
+microglia <- addUMAP(
+  ArchRProj   = microglia,
+  reducedDims = "Harmony_microglia_atac",
+  name        = "UMAP_microglia_atac",
+  nNeighbors  = 50,
+  minDist     = 0.5,
+  metric      = "cosine",
+  force       = TRUE,
+  seed        = 123
+)
+
+microglia <- addUMAP(
+  ArchRProj   = microglia,
+  reducedDims = "Harmony_microglia_rna",
+  name        = "UMAP_microglia_rna",
+  nNeighbors  = 50,
+  minDist     = 0.5,
+  metric      = "cosine",
+  force       = TRUE,
+  seed        = 123
+)
+```
+
+
+```{r}
+# ── Sonication status (recreate if missing) ─────────────────────────────────
+if (!"SonicationStatus" %in% colnames(microglia@cellColData)) {
+  microglia$SonicationStatus <- ifelse(
+    microglia$Sample %in% c("P10-sonicated", "P8-sonicated"),
+    "Sonicated", "Non-sonicated"
+  )
+}
+table(microglia$SonicationStatus)
+
+# ── Combined ATAC+RNA dims, clustering, UMAP ────────────────────────────────
+microglia <- addCombinedDims(
+  ArchRProj   = microglia,
+  reducedDims = c("Harmony_microglia_atac", "Harmony_microglia_rna"),
+  name        = "Harmony_microglia_combined"
+)
+
+# Rename combined RD columns (helps some Seurat/ArchR internals)
+rdname <- "Harmony_microglia_combined"
+rd <- microglia@reducedDims[[rdname]]
+colnames(rd$matRD) <- paste0("Harmony", seq_len(ncol(rd$matRD)))
+microglia@reducedDims[[rdname]] <- rd
+
+microglia <- addClusters(
+  input       = microglia,
+  reducedDims = "Harmony_microglia_combined",
+  name        = "combined_ham_microglia_clusters",
+  method      = "Seurat",
+  resolution  = 3,
+  force       = TRUE,
+  maxClusters = 80
+)
+
+microglia <- addUMAP(
+  ArchRProj   = microglia,
+  reducedDims = "Harmony_microglia_combined",
+  name        = "UMAP_Harmony_microglia_combined",
+  nNeighbors  = 55,
+  minDist     = 0.8,
+  metric      = "cosine",
+  force       = TRUE,
+  seed        = 19
+)
+```
+
+```{r}
+# To provide the color codes for sonication status
+pal_sonivsnonsoni <- c(
+  "Sonicated" = '#542788', 
+  "Non-sonicated" = "#00BCD4")
+
+# Plot the UMAP for combined Harmony dimensions
+UMAP_combined_Sonication <- plotEmbedding(
+  ArchRProj = microglia, 
+  embedding = "UMAP_Harmony_microglia_combined", 
+  colorBy = "cellColData", 
+  name = "SonicationStatus",  # You can change this to any metadata column
+  size = 5,
+  pal = pal_sonivsnonsoni,
+  labelMeans  = FALSE
+)
+
+#Figure 4b
+print(UMAP_combined_Sonication)
+
+# ── Save subset project object ──────────────────────────────────────────────
+saveRDS(
+  microglia,
+  file = file.path(microglia_output_dir, "Microglia_multiome_with_embeddings.rds")
+)
+message("Saved to: ", file.path(microglia_output_dir, "Microglia_multiome_with_embeddings.rds"))
+```
+

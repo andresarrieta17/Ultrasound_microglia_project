@@ -1,0 +1,21 @@
+.Rhistory
+.RData
+.Rproj.user/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+
+# Large data (keep out of repo)
+*.rds
+*.h5
+*.hdf5
+*.mtx
+*.tsv
+*.csv
+*.loom
+*.arrow
+*.gz
+*.zip
+
+# Allow the small mapping file if desired (comment out if large)
+!code/resources/homologs.rds

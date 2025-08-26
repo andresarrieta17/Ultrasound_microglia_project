@@ -1,0 +1,87 @@
+---
+title: "11. Exported_files_for_CellOracle"
+author: "Victor A. Arrieta"
+date: "2025-08-26"
+output: html_document
+---
+
+#To generate a motif scan
+```{r}
+microglia <- addMotifAnnotations(
+  ArchRProj = microglia,          # Your ArchR project object
+  motifSet = "cisbp",        # Choose "cisbp" or "JASPAR2020", etc.
+  name = "Motif",             # Name for the motif annotation
+  force = TRUE
+)
+
+# 2) your GRangesList of motif hits
+pos       <- getPositions(microglia)    # names(pos) = motif IDs
+
+peak_ids  <- paste0(
+               seqnames(peakSet),  "_",
+               start(peakSet),     "_",
+               end(peakSet)
+             )
+
+# 3) flatten each motif → overlaps into a data.frame
+motif_tbl <- do.call(rbind, lapply(names(pos), function(motif) {
+  gr  <- pos[[motif]]
+  ov  <- findOverlaps(gr, peakSet, type="within")
+  data.frame(
+    peak_id  = peak_ids[subjectHits(ov)],
+    motif_id = motif,
+    score    = mcols(gr)$score[queryHits(ov)],
+    stringsAsFactors = FALSE
+  )
+}))
+
+# 4) write it out
+write.csv(
+  motif_tbl,
+  file      = "archr_motif_positions.csv",
+  row.names = FALSE,
+  quote     = FALSE
+)
+
+message("✔ Wrote ", nrow(motif_tbl),
+        " rows to archr_motif_positions.csv")
+
+```
+
+#The ArchR function addPeak2GeneLinks() is your one‐stop way to generate a peak ↔ gene linkage table
+```{r}
+# Re‐run in ArchR linking peaks to *gene activity* (all genes)
+microglia <- addPeak2GeneLinks(
+  ArchRProj   = microglia,
+  useMatrix   = "GeneScoreMatrix",       # <— ATAC‐derived gene activity for *all* genes
+  reducedDims = "Harmony_microglia_combined",
+  corCutOff   = 0.2,
+  maxDist     = 500000
+)
+
+# Then regenerate df_out exactly as before:
+peakSet <- getPeakSet(microglia)
+
+# Pull out the Peak2GeneLinks GRanges
+p2g <- getPeak2GeneLinks(
+  ArchRProj = microglia,
+  resolution = 1,
+  returnLoops = FALSE)
+
+p2g
+
+df_out <- data.frame(
+  peak_id         = paste0(
+                       seqnames(peakSet)[ p2g$idxATAC ], "_",
+                       start(peakSet)[   p2g$idxATAC ], "_",
+                       end(peakSet)[     p2g$idxATAC ]
+                     ),
+  gene_short_name = mcols(gene_gr)$symbol[ p2g$idxRNA ],
+  correlation     =     p2g$Correlation
+)
+df_out <- df_out[!is.na(df_out$gene_short_name), ]
+
+write.csv(df_out, "peak2gene_archr_allGenes.csv",
+          row.names=FALSE, quote=FALSE)
+
+```

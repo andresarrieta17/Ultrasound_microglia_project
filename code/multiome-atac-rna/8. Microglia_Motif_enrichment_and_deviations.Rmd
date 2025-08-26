@@ -1,0 +1,142 @@
+---
+title: "8. Microglia_Motif_enrichment_and_deviations"
+author: "Victor A. Arrieta"
+date: "2025-08-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# Load packages
+library(ggseqlogo)
+library(chromVARmotifs)
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(ArchR)
+```
+
+#Load the ArchR object
+```{r}
+microglia <- readRDS("Microglia_multiome_with_peaks.rds")
+```
+
+```{r}
+# Add motif annotations to your ArchR project
+microglia <- addMotifAnnotations(
+  ArchRProj = microglia,          # Your ArchR project object
+  motifSet = "cisbp",        # Choose "cisbp" or "JASPAR2020", etc.
+  name = "Motif",             # Name for the motif annotation
+  force = TRUE
+)
+
+# Perform motif enrichment on upregulated peaks
+motifsUp_microglia <- peakAnnoEnrichment(
+  seMarker = markersPeaks_microglia,
+  ArchRProj = microglia,
+  peakAnnotation = "Motif",
+  cutOff = "FDR <= 0.1 & Log2FC >= 0.1"
+)
+
+# Inspect enrichment results
+motifsUp_microglia
+```
+
+# Visualization of Motif Enrichment Results
+Convert the motifsUp SummarizedExperiment object into a data frame suitable for plotting with ggplot2.
+```{r}
+# Create a data frame from enrichment results
+df <- data.frame(
+  TF = rownames(motifsUp_microglia),
+  mlog10Padj = assay(motifsUp_microglia)[, 1]  # Assuming 'mlog10Padj' is the first assay
+)
+
+# Order the data frame by significance
+df <- df[order(df$mlog10Padj, decreasing = TRUE), ]
+
+# Assign ranks based on significance
+df$rank <- seq_len(nrow(df))
+head(df)
+```
+
+# Plot the Enrichment Dot Plot
+```{r}
+#Figure 5b
+
+# Create the dot plot
+ggUp <- ggplot(df, aes(rank, mlog10Padj, color = mlog10Padj)) + 
+  geom_point(size = 3.5) +  # Increase point size slightly for visibility
+  ggrepel::geom_label_repel(
+    data = df[1:30, ],  # Label the top 30 motifs
+    aes(x = rank, y = mlog10Padj, label = TF), 
+    size = 5,  # Increase the label font size
+    nudge_x = 2,
+    color = "black"
+  ) + 
+  theme_minimal() + 
+  ylab("-log10(FDR) Motif Enrichment") + 
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = RColorBrewer::brewer.pal(9, "YlOrRd")) +
+  theme(
+        # turn the axes back on
+    axis.line.x   = element_line(color = "black"),
+    axis.line.y   = element_line(color = "black"),
+    axis.ticks    = element_line(color = "black"),
+    axis.title = element_text(size = 16),  # Increase axis title font size
+    axis.text.x    = element_text(size = 14, color = "black"),
+    axis.text.y    = element_text(size = 14, color = "black"),
+    legend.text = element_text(size = 14), # Increase legend text font size
+    legend.title = element_text(size = 14) # Increase legend title font size
+  )
+
+
+# Display the plot
+print(ggUp)
+
+```
+
+# Plotting Motif Logos
+Extract Motif Information
+Choose a motif of interest and extract its Position Weight Matrix (PWM).
+```{r}
+# Choose a specific motif (e.g., "FOSL2_105")
+motifName <- "FOS_137"
+motifName <- "JUNB_139"
+motifName <- "FOSL2_105"
+
+# Extract the PWMatrix object for the chosen motif
+pwm <- getPeakAnnotation(microglia, "Motif")$motifs[[motifName]]
+
+# Inspect the PWM
+print(pwm)
+```
+
+# Convert PWMatrix to Position Probability Matrix (PPM)
+Convert the PWM to a PPM suitable for plotting with ggseqlogo.
+```{r}
+# Define a function to convert PWMatrix to PPM
+PWMatrixToProbMatrix <- function(x){
+  if (class(x) != "PWMatrix") stop("x must be a TFBSTools::PWMatrix object")
+  m <- (exp(as(x, "matrix"))) * TFBSTools::bg(x)/sum(TFBSTools::bg(x))
+  m <- t(t(m)/colSums(m))
+  return(m)
+}
+
+# Convert the PWM to PPM
+ppm <- PWMatrixToProbMatrix(pwm)
+
+# Inspect the PPM
+print(ppm)
+```
+
+# Plot the Motif Logo Using ggseqlogo
+Use ggseqlogo to visualize the motif logo.
+#Figure 5c
+```{r}
+### Plot the PWM as bits
+ggseqlogo(ppm, method = "bits") + 
+  ggtitle(paste("Motif Logo for", motifName))
+
+```
+

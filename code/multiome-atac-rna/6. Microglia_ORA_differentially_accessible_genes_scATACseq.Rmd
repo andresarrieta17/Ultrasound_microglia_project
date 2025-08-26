@@ -1,0 +1,253 @@
+---
+title: "6. ORA_differentially_accessible_genes_scATACseq"
+author: "Victor A. Arrieta"
+date: "2025-08-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# Pull out FDR & Log2FC matrices, plus the gene symbols
+fdr_mat    <- assay(ATAC_features_sonication, "FDR")
+log2fc_mat <- assay(ATAC_features_sonication, "Log2FC")
+genes_all  <- rowData(ATAC_features_sonication)$name
+
+# Find the row‐indices for Sonicated vs Non‐sonicated
+idx_soni <- which(
+  fdr_mat[, "Sonicated"] <= 0.01 &
+  log2fc_mat[, "Sonicated"] >= 0.1
+)
+
+idx_non <- which(
+  fdr_mat[, "Non-sonicated"] <= 0.01 &
+  log2fc_mat[, "Non-sonicated"] >= 0.1
+)
+
+# Checking dimensions
+length(idx_soni)
+length(idx_non)
+length(unique(c(idx_soni, idx_non)))  
+
+# Pull the symbols themselves
+soni_genes <- genes_all[idx_soni]
+non_genes  <- genes_all[idx_non]
+
+# Build data.frames
+soni_genes_df <- data.frame(
+  gene   = soni_genes,
+  fdr    = fdr_mat[idx_soni, "Sonicated"],
+  log2FC = log2fc_mat[idx_soni, "Sonicated"],
+  stringsAsFactors = FALSE
+)
+
+non_genes_df <- data.frame(
+  gene   = non_genes,
+  fdr    = fdr_mat[idx_non, "Non-sonicated"],
+  log2FC = log2fc_mat[idx_non, "Non-sonicated"],
+  stringsAsFactors = FALSE
+)
+
+# Check the first rows
+head(soni_genes_df)
+head(non_genes_df)
+
+
+# Run GO:BP ORA on each
+ora_soni <- enrichGO(
+  gene          = soni_genes,
+  universe      = genes_all,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.1,
+  qvalueCutoff = 0.05,
+  readable      = TRUE
+)
+
+ora_non <- enrichGO(
+  gene          = non_genes,
+  universe      = genes_all,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.1,
+  qvalueCutoff = 0.05,
+  readable      = TRUE
+)
+```
+
+```{r}
+# Turn ORA output into data.frames, tag Direction
+df_soni <- as.data.frame(ora_soni) %>% mutate(Direction="Sonicated")
+df_non  <- as.data.frame(ora_non)  %>% mutate(Direction="Non-Sonicated")
+
+# Choose top 10 by ascending p.adjust
+top_n <- 13
+top_s <- df_soni %>% arrange(p.adjust) %>% slice_head(n = top_n)
+top_ns <- df_non %>% arrange(p.adjust) %>% slice_head(n = top_n)
+
+combined <- bind_rows(top_s, top_ns)
+
+# wrap long GO names
+wrapText <- function(x, len=50) {
+  sapply(x, function(y) {
+    if (nchar(y) > len) gsub(paste0("(.{",len,"})"), "\\1\n", y, perl=TRUE)
+    else y
+  }, USE.NAMES = FALSE)
+}
+
+combined <- combined %>%
+  mutate(
+    Term_wrapped = wrapText(Description, len = 70),
+    Direction = factor(Direction, levels = c("Sonicated", "Non-Sonicated"))
+  )
+
+# Set your palette
+custom_pal <- c(
+  "#ff3f0b",
+  "#f56a35",
+  "#e79578",
+  "white",
+  "#a7d8ed",
+  "#1f96c5",
+  "#1e91c0"
+)
+
+# Sonicated dot‐plot (smallest p on top)
+son_terms <- combined %>%
+  filter(Direction=="Sonicated") %>%
+  arrange(p.adjust) %>%
+  mutate(
+    Term_wrapped = factor(Term_wrapped, levels = rev(unique(Term_wrapped)))
+  )
+
+pmin <- min(son_terms$p.adjust)
+pmax <- max(son_terms$p.adjust)
+
+#Figure 4d
+# To generate the dot plot after ORA analysis
+p_son <- ggplot(son_terms, aes(x = Direction, y = Term_wrapped)) +
+  geom_point(aes(size = Count, fill = p.adjust),
+             shape = 21, color = "black", stroke = 0.5) +
+  scale_fill_gradientn(colours = custom_pal,
+                       name    = "Adj. p-value",
+                       limits  = c(pmin, pmax),
+                       trans   = "log10",
+                       oob     = scales::squish) +
+  scale_size_continuous(range = c(4,12),
+                        name = "Gene set size",
+                        guide = guide_legend(override.aes = list(fill="black"))) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_family = "Helvetica") +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(size=0, angle=30, hjust=1, colour = "black"),
+        axis.text.y = element_text(size=17, colour = "black"),
+        plot.title  = element_text(face="bold"),
+        legend.title= element_text(size=14),
+        legend.text = element_text(size=13, colour = "black"))
+
+print(p_son)
+
+
+# Non-Sonicated dot-plot (lowest p on top)
+ns_terms <- combined %>%
+  filter(Direction == "Non-Sonicated") %>%
+  arrange(p.adjust) %>%   # ascending p.adjust
+  mutate(
+    Term_wrapped = factor(Term_wrapped, levels = rev(unique(Term_wrapped)))
+  )
+
+pmin_ns <- min(ns_terms$p.adjust)
+pmax_ns <- max(ns_terms$p.adjust)
+
+p_non <- ggplot(ns_terms, aes(x = Direction, y = Term_wrapped)) +
+  geom_point(aes(size = Count, fill = p.adjust),
+             shape = 21, color = "black", stroke = 0.5) +
+  scale_fill_gradientn(colours = custom_pal,
+                       name    = "Adj. p-value",
+                       limits  = c(pmin_ns, pmax_ns),
+                       trans   = "log10",
+                       oob     = scales::squish) +
+  scale_size_continuous(range = c(5,13),
+                        name = "Gene set size",
+                        guide = guide_legend(override.aes = list(fill="black"))) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_family = "Helvetica") +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(size=17, angle=30, hjust=1, colour = "black"),
+        axis.text.y = element_text(size=15, colour = "black"),
+        plot.title  = element_text(face="bold"),
+        legend.title= element_text(size=14),
+        legend.text = element_text(size=13, colour = "black"))
+
+print(p_non)
+```
+
+#To add and plot the CHEMOTAXIS module 
+```{r}
+# Extract the GeneScoreMatrix SummarizedExperiment directly
+gsm_se <- getMatrixFromProject(
+  ArchRProj = microglia,
+  useMatrix = "GeneScoreMatrix"
+)
+
+# Pull out rowData(gsm_se)
+all_genes_mat <- rowData(gsm_se)$name
+length(all_genes_mat)
+# e.g. 24919
+
+go_id <- "GO:0060326" #GO:0060326 for cell chemotaxis
+go_hits <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys    = go_id,
+  keytype = "GOALL",
+  columns = c("ENTREZID","SYMBOL")
+)
+genes_for_go <- unique(go_hits$SYMBOL)  
+
+# Subset to only genes present in the GeneScoreMatrix
+present_genes <- intersect(genes_for_go, all_genes_mat)
+length(present_genes)  
+
+# Build the feature list
+microgliaFeatures <- list(
+  MicrogliaModule = present_genes
+)
+
+# Add module score (no NAs now)
+microglia <- addModuleScore(
+  ArchRProj = microglia,
+  useMatrix = "GeneScoreMatrix",
+  name      = "MGMod",
+  features  = microgliaFeatures
+)
+
+# Confirm the new column
+head(microglia$MGMod.MicrogliaModule)
+
+# Add Impute Weights using Harmony combined dimensions
+microglia <- addImputeWeights(
+  ArchRProj = microglia,
+  reducedDims = "Harmony_microglia_combined"  # Ensure this matches your reduced dimensions name
+)
+
+# Figure 4e
+
+# Plot on UMAP
+pMod <- plotEmbedding(
+  ArchRProj     = microglia,
+  embedding     = "UMAP_Harmony_microglia_combined",
+  colorBy       = "cellColData",
+  name          = "MGMod.MicrogliaModule",
+  imputeWeights = getImputeWeights(microglia),
+  plotAs        = "points",
+  size          = 4,
+  continuousSet = "horizonExtra"
+)
+print(pMod)
+
+```
+

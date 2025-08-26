@@ -1,0 +1,1447 @@
+---
+title: "9. Cell_cell_interaction_analysis"
+author: "Victor A. Arrieta"
+date: "2025-08-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+set.seed(33)
+
+# Minimal required packages
+pkgs <- c("CellChat", "dplyr", "tidyr", "ggplot2", "cowplot", "purrr", "ggrepel", "scales")
+missing <- pkgs[!sapply(pkgs, require, character.only = TRUE)]
+if (length(missing)) stop("Missing packages: ", paste(missing, collapse = ", "))
+
+```
+
+#Prepare Seurat input for CellChat
+```{r}
+# 1) Drop low-utility cell types
+cells_to_keep <- WhichCells(
+  integrated_data,
+  expression = !cell_phenotype %in% c("Low-quality", "Platelet", "HSPC")
+)
+integrated_data_subset <- subset(integrated_data, cells = cells_to_keep)
+
+# 2) Join RNA layers and normalize
+integrated_data_subset <- JoinLayers(integrated_data_subset, assay = "RNA")
+DefaultAssay(integrated_data_subset) <- "RNA"
+integrated_data_subset <- NormalizeData(integrated_data_subset)
+
+```
+
+#Build CellChat object (all samples together)
+```{r}
+cellchat <- createCellChat(object = integrated_data_subset, group.by = "cell_phenotype")
+
+# Use human LR database
+CellChatDB <- CellChatDB.human
+cellchat@DB <- CellChatDB
+
+```
+
+#(Optional) Export pathway gene lists
+```{r}
+pathways.available <- unique(CellChatDB$interaction$pathway_name)
+
+genes.by.pathway <- lapply(pathways.available, function(pw) {
+  CellChatDB$interaction |>
+    dplyr::filter(pathway_name == pw) |>
+    dplyr::select(ligand, receptor) |>
+    tidyr::pivot_longer(dplyr::everything(), values_to = "gene") |>
+    dplyr::distinct(gene) |>
+    dplyr::pull(gene)
+})
+names(genes.by.pathway) <- pathways.available
+
+# Wide matrix (one column per pathway) — convenient for quick browsing
+max_len <- max(lengths(genes.by.pathway))
+df_genes_matrix <- as.data.frame(
+  lapply(genes.by.pathway, function(g) { length(g) <- max_len; g }),
+  stringsAsFactors = FALSE, check.names = FALSE
+)
+
+write.csv(df_genes_matrix, "CellChat_pathway_genes_matrix.csv", row.names = FALSE, na = "")
+
+```
+
+#Preprocessing & probability inference (all samples)
+```{r}
+# Remove unused factor levels in group labels
+cellchat@idents <- droplevels(cellchat@idents)
+
+# Standard CellChat pipeline
+cellchat <- subsetData(cellchat)
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+
+# Robust average expression (10% truncated mean) and account for population size
+cellchat <- computeCommunProb(cellchat, type = "truncatedMean", trim = 0.1, population.size = TRUE)
+cellchat <- filterCommunication(cellchat, min.cells = 100)
+
+# Pathway-level aggregation
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+
+```
+
+#Export interaction table (all samples)
+```{r}
+df.net <- subsetCommunication(cellchat)
+write.csv(df.net, "cellchat_all_interactions.csv", row.names = FALSE)
+
+```
+
+#Split by condition and run per-group analyses
+```{r}
+# Split Seurat object
+seurat_nonsonicated <- subset(integrated_data_subset, subset = orig.ident == "Non-sonicated")
+seurat_sonicated    <- subset(integrated_data_subset, subset = orig.ident == "Sonicated")
+DefaultAssay(seurat_nonsonicated) <- "RNA"
+DefaultAssay(seurat_sonicated)    <- "RNA"
+
+# Create CellChat objects
+cellchat_nonsonicated <- createCellChat(object = seurat_nonsonicated, group.by = "cell_phenotype")
+cellchat_sonicated    <- createCellChat(object = seurat_sonicated,    group.by = "cell_phenotype")
+cellchat_nonsonicated@DB <- CellChatDB
+cellchat_sonicated@DB    <- CellChatDB
+
+# Pipeline function to avoid repetition
+run_cellchat <- function(x, min.cells = 10) {
+  x@idents <- droplevels(x@idents)
+  x <- subsetData(x)
+  x <- identifyOverExpressedGenes(x)
+  x <- identifyOverExpressedInteractions(x)
+  x <- computeCommunProb(x, type = "truncatedMean", trim = 0.1, population.size = TRUE)
+  x <- filterCommunication(x, min.cells = min.cells)
+  x <- computeCommunProbPathway(x)
+  x <- aggregateNet(x)
+  x
+}
+
+cellchat_nonsonicated <- run_cellchat(cellchat_nonsonicated, min.cells = 10)
+cellchat_sonicated    <- run_cellchat(cellchat_sonicated,    min.cells = 10)
+
+```
+
+#Save / reload CellChat objects
+```{r}
+saveRDS(cellchat_nonsonicated, "cellchat_nonsonicated.rds")
+saveRDS(cellchat_sonicated,    "cellchat_sonicated.rds")
+
+# Reload if needed
+# cellchat_nonsonicated <- readRDS("cellchat_nonsonicated.rds")
+# cellchat_sonicated    <- readRDS("cellchat_sonicated.rds")
+
+```
+
+#Export per-group interaction tables
+```{r}
+df.net_nonsonicated <- subsetCommunication(cellchat_nonsonicated)
+df.net_sonicated    <- subsetCommunication(cellchat_sonicated)
+
+write.csv(df.net_nonsonicated, "cellchat_nonsonicated_interactions.csv", row.names = FALSE)
+write.csv(df.net_sonicated,    "cellchat_sonicated_interactions.csv",    row.names = FALSE)
+
+# Combined long table with group label
+combined_df <- dplyr::bind_rows(
+  dplyr::mutate(df.net_nonsonicated, group = "Non-sonicated"),
+  dplyr::mutate(df.net_sonicated,    group = "Sonicated")
+)
+
+```
+
+#Quick network overviews (counts & strengths)
+```{r}
+par(mfrow = c(1,2), xpd = TRUE)
+
+groupSize_non <- as.numeric(table(cellchat_nonsonicated@idents))
+netVisual_circle(cellchat_nonsonicated@net$count,
+                 vertex.weight = groupSize_non, weight.scale = TRUE,
+                 label.edge = FALSE, title.name = "Non-sonicated: # interactions")
+netVisual_circle(cellchat_nonsonicated@net$weight,
+                 vertex.weight = groupSize_non, weight.scale = TRUE,
+                 label.edge = FALSE, title.name = "Non-sonicated: interaction strength")
+
+groupSize_son <- as.numeric(table(cellchat_sonicated@idents))
+netVisual_circle(cellchat_sonicated@net$count,
+                 vertex.weight = groupSize_son, weight.scale = TRUE,
+                 label.edge = FALSE, title.name = "Sonicated: # interactions")
+netVisual_circle(cellchat_sonicated@net$weight,
+                 vertex.weight = groupSize_son, weight.scale = TRUE,
+                 label.edge = FALSE, title.name = "Sonicated: interaction strength")
+
+```
+
+#Merge for condition comparison
+```{r}
+chat_list <- list("Non-sonication" = cellchat_nonsonicated,
+                  "Sonication"     = cellchat_sonicated)
+chat_merged <- mergeCellChat(chat_list, add.names = names(chat_list))
+
+```
+
+#Compare global counts/strengths and differential edges
+```{r}
+# Side-by-side overview
+cowplot::plot_grid(
+  compareInteractions(chat_merged, show.legend = FALSE, group = c(1,2)),
+  compareInteractions(chat_merged, show.legend = FALSE, group = c(1,2), measure = "weight")
+)
+
+# Differential circles (counts and strengths)
+netVisual_diffInteraction(chat_merged, weight.scale = TRUE,  edge.width.max = 12)
+netVisual_diffInteraction(chat_merged, weight.scale = TRUE,  edge.width.max = 60, measure = "weight")
+
+```
+
+#Show gained / lost edges (circle plots)
+```{r}
+metric <- "weight"   # or "count"
+
+mat.non <- chat_merged@net$`Non-sonication`[[metric]]
+mat.son <- chat_merged@net$Sonication[[metric]]
+stopifnot(identical(dimnames(mat.non), dimnames(mat.son)))
+
+diff.mat <- mat.son - mat.non
+gain.mat <- pmax(diff.mat, 0)        # gained with sonication
+loss.mat <- pmax(-diff.mat, 0)       # lost with sonication
+
+# Simple palette by group order
+grp.order <- rownames(mat.son)
+cell.cols <- c(
+  "Astrocyte"      = '#371377', "OPC" = '#7700FF', "RG"  = '#9E0142',
+  "Macrophage"     = '#FF0080', "Platelet" = '#DC494C', "Endothelial" = "#FF4500",
+  "B cells"        = "#FAD510", "pDC" = "#FFFF5F", "Mural cell" = '#0df600',
+  "Plasmablast"    = '#238B45', "Dendritic cell" = "#02401B", "Monocyte" = "#00d4ff",
+  "Oligodendrocyte"= '#1e99d1', "Microglia" = '#542788', "NK" = "#8A2BE2",
+  "T cell"         = "#f769a1", "Tumor cells" = "#C06CAB"
+)
+cols.use <- unname(cell.cols[grp.order])
+v.weight <- rowSums(mat.son + mat.non)
+
+par(mfrow = c(1,2), xpd = TRUE)
+netVisual_circle(loss.mat, color.use = cols.use, title.name = "Lost after sonication",
+                 vertex.weight = 2, vertex.size.max = 20, edge.width.max = 2000,
+                 edge.weight.max = max(loss.mat), label.edge = FALSE, alpha.edge = 0.7)
+netVisual_circle(gain.mat, color.use = cols.use, title.name = "Gained after sonication",
+                 vertex.weight = 2, vertex.size.max = 20, edge.width.max = 2000,
+                 edge.weight.max = max(gain.mat), label.edge = FALSE, alpha.edge = 0.7)
+
+
+```
+
+#Rank pathways by Δ strength
+```{r}
+#Extended Data Figure 5a
+
+# Bar plot (and data if needed)
+rankNet(
+  object     = chat_merged,
+  slot.name  = "netP",                # use the pathway‐level slot
+  measure    = "weight",              # sum of interaction strengths
+  mode       = "comparison",
+  color.use = c("#6A1B9A", "#00BCD4"),
+  do.stat = TRUE,
+  comparison = c(2, 1),
+  stacked = TRUE,                     # To show the bar plot as a stacked bar plot or not
+  return.data = FALSE                 # default: plot a bar chart
+)
+
+diff_pathways <- rankNet(chat_merged, slot.name = "netP", measure = "weight",
+                         mode = "comparison", do.stat = TRUE,
+                         comparison = c(2,1), return.data = TRUE)
+path_df <- diff_pathways$signaling.contribution
+
+```
+
+#Plot a specific pathway in each condition
+```{r}
+#Figure 2d
+
+get_obj_palette <- function(obj, palette) {
+  g <- levels(obj@idents); p <- palette[g]; if (anyNA(p)) stop("Missing colours")
+  unname(p)
+}
+
+pathways.show <- "VEGF"
+weight.max    <- getMaxWeight(chat_list, slot.name = "netP", attribute = pathways.show)
+
+par(mfrow = c(1,2), xpd = TRUE)
+
+pal.non <- get_obj_palette(chat_list[["Non-sonication"]], cell.cols)
+netVisual_aggregate(chat_list[["Non-sonication"]], signaling = pathways.show,
+                    layout = "circle", color.use = pal.non,
+                    edge.weight.max = weight.max[1], edge.width.max = 50,
+                    vertex.weight = 2, vertex.size.max = 20,
+                    signaling.name = paste0(pathways.show, " — Non-sonication"))
+
+pal.son <- get_obj_palette(chat_list[["Sonication"]], cell.cols)
+netVisual_aggregate(chat_list[["Sonication"]], signaling = pathways.show,
+                    layout = "circle", color.use = pal.son,
+                    edge.weight.max = weight.max[1], edge.width.max = 50,
+                    vertex.weight = 2, vertex.size.max = 20,
+                    signaling.name = paste0(pathways.show, " — Sonication"))
+
+```
+
+
+
+#Interactions between microglia and microglia
+```{r}
+##–– 1. Keep only Microglia → Microglia rows –––––––––––––––––––
+mg2mg <- df_diff %>% 
+  filter(source == "Microglia", target == "Microglia")
+
+##–– take top 15 positive and top 15 negative Δprob ––––––––––
+top_up   <- mg2mg %>% arrange(dplyr::desc(delta_prob)) %>%  slice_head(n = 13)
+top_down <- mg2mg %>% arrange(     delta_prob) %>%  slice_head(n = 13)
+
+plot_df  <- bind_rows(top_up, top_down) %>% 
+  # order factor so bars plot top→bottom
+  mutate(interaction = factor(interaction, levels = rev(unique(interaction))))
+
+```
+
+```{r}
+plot_df <- plot_df %>% 
+  mutate(prob_non  = as.vector(cellchat_nonsonicated@net$prob[
+           "Microglia","Microglia", interaction]),
+         prob_sono = as.vector(cellchat_sonicated@net$prob[
+           "Microglia","Microglia", interaction]))
+
+```
+
+#Bar pplot
+```{r}
+#Figure 2g
+
+# --- 1. keep top 15 up & down ----------------------------------------
+mg2mg <- df_diff %>% 
+  filter(source == "Microglia", target == "Microglia")
+
+plot_df <- bind_rows(
+  mg2mg %>% arrange(dplyr::desc(delta_prob)) %>% slice_head(n = 13),  # +Δ first
+  mg2mg %>% arrange(              delta_prob) %>% slice_head(n = 13)  # –Δ next
+) %>% 
+  mutate(interaction = forcats::fct_reorder(interaction, delta_prob, .desc = TRUE),
+         sign        = dplyr::if_else(delta_prob > 0, "Sonicated", "Non-sonicated"))
+
+
+# --- 2. bar plot -----------------------------------------------------
+ggplot(plot_df, aes(x = interaction, y = delta_prob, fill = sign)) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = c(
+    "Sonicated"     = '#542788',
+    "Non-sonicated" = "#00BCD4"
+  )) +
+  
+  # Force y-axis to plain numeric labels (no sci notation)
+  scale_y_continuous(
+  labels = function(x) format(x, scientific = FALSE, trim = TRUE),
+  expand = expansion(mult = c(0, 0.05))
+  ) +
+  
+  labs(
+    x    = NULL,
+    y    = "Change in signalling strength\n(Sonicated – Non-sonicated)",
+    fill = NULL
+  ) +
+  
+  theme_classic(base_size = 11, base_family = "Helvetica") +
+  theme(
+    axis.text.x     = element_text(angle = 45, size = 12, hjust = 1, colour = "black"),
+    axis.text.y     = element_text(size = 11, colour = "black"),
+    axis.title.y    = element_text(size = 13, colour = "black"),
+    axis.title      = element_text(colour = "black"),
+    legend.position = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line       = element_line(size = 0.3, colour = "black")
+  )
+```
+
+###Bubble plot
+```{r}
+# 1. Extract log-normalized RNA matrices
+rna_non  <- as.matrix(GetAssayData(seurat_nonsonicated, assay="RNA", slot="data"))
+rna_sono <- as.matrix(GetAssayData(seurat_sonicated,    assay="RNA", slot="data"))
+
+# 2. Helper to average expression for 1+ genes
+get_expr <- function(mat, genes, cells) {
+  genes <- intersect(genes, rownames(mat))
+  if (length(genes) == 0) return(NA_real_)
+  mean(mat[genes, cells, drop=FALSE])
+}
+
+# 3. Define cell sets
+mg_non    <- WhichCells(seurat_nonsonicated, expression = cell_phenotype=="Microglia")
+mg_non  <- WhichCells(seurat_nonsonicated, expression = cell_phenotype=="Microglia")
+mg_sono   <- WhichCells(seurat_sonicated,    expression = cell_phenotype=="Microglia")
+mg_sono <- WhichCells(seurat_sonicated,    expression = cell_phenotype=="Microglia")
+
+# 4. Pick top/bottom 13 interactions
+mg2mg <- df_diff %>% filter(source=="Microglia", target=="Microglia")
+
+plot_df <- bind_rows(
+  mg2mg %>% dplyr::arrange(desc(delta_prob)) %>% slice_head(n=13),
+  mg2mg %>% dplyr::arrange(delta_prob)      %>% slice_head(n=13)
+) %>% 
+  mutate(
+    interaction = forcats::fct_reorder(interaction, delta_prob, .desc=TRUE),
+    driver      = if_else(delta_prob>0, "Sonicated","Non-sonicated")
+  )
+```
+
+
+```{r}
+## 1. Prep: get all unique ligand and receptor combos
+ligands   <- unique(plot_df$ligand)
+receptors <- unique(plot_df$receptor)
+
+# split out every subunit so we know which features to ask for
+all_lig_feats   <- unique(unlist(strsplit(ligands,   "_")))
+all_rec_feats   <- unique(unlist(strsplit(receptors, "_")))
+
+## 2. Compute average log‐normalized RNA@data by cell_phenotype & condition
+# Non-sonicated
+ae_non <- AverageExpression(
+  seurat_nonsonicated,
+  assays   = "RNA",
+  slot     = "data",
+  group.by = "cell_phenotype",
+  features = unique(c(all_lig_feats, all_rec_feats))
+)$RNA
+
+# Sonicated
+ae_sono <- AverageExpression(
+  seurat_sonicated,
+  assays   = "RNA",
+  slot     = "data",
+  group.by = "cell_phenotype",
+  features = unique(c(all_lig_feats, all_rec_feats))
+)$RNA
+
+## 3. Build a lookup table of ligand & receptor means
+get_mean <- function(ae_mat, gene_combo, celltype) {
+  genes <- strsplit(gene_combo, "_")[[1]]
+  genes <- intersect(genes, rownames(ae_mat))
+  if (length(genes) == 0) return(NA_real_)
+  mean(ae_mat[genes, celltype])
+}
+
+ligand_lookup <- tibble(
+  ligand = ligands,
+  ligand_non   = map_dbl(ligand, ~ get_mean(ae_non,   .x, "Microglia")),
+  ligand_sono  = map_dbl(ligand, ~ get_mean(ae_sono,  .x, "Microglia"))
+)
+
+receptor_lookup <- tibble(
+  receptor = receptors,
+  receptor_non   = map_dbl(receptor, ~ get_mean(ae_non,   .x, "Microglia")),
+  receptor_sono  = map_dbl(receptor, ~ get_mean(ae_sono,  .x, "Microglia"))
+)
+
+## 4. Merge back onto plot_df and compute deltas
+expr_df <- plot_df %>%
+  left_join(ligand_lookup,   by = "ligand")  %>%
+  left_join(receptor_lookup, by = "receptor") %>%
+  mutate(
+    ligand_delta   = ligand_sono  - ligand_non,
+    receptor_delta = receptor_sono - receptor_non,
+    size           = abs(delta_prob)
+  )
+
+## 5. Quick sanity-check
+print(dim(expr_df))           # should be 30 rows
+print(head(expr_df, 3)[, c( "ligand", "ligand_non","ligand_sono",
+                             "receptor","receptor_non","receptor_sono")])
+summary(expr_df[, c("ligand_non","ligand_sono","receptor_non","receptor_sono")])
+
+```
+
+
+```{r}
+# Define your pink/blue fills
+custom_cols <- c("Sonicated"     = '#542788',
+                 "Non-sonicated" = "#00BCD4")
+
+# 1. Build the ggplot object
+p_bubble <- ggplot(expr_df, aes(x = ligand_delta, y = receptor_delta)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_point(aes(size = size, fill = driver),
+             shape = 21, color = "black", alpha = 0.8) +
+  geom_text_repel(aes(label = interaction),
+                  size = 3, max.overlaps = 20) +
+  scale_fill_manual(values = custom_cols) +
+  scale_size_continuous(range = c(4, 12)) +
+  labs(
+    x    = "Δ ligand expression (Sonicated − Non-sonicated)",
+    y    = "Δ receptor expression (Sonicated − Non-sonicated)",
+    size = "|Δ signalling score|",
+    fill = "Driver"
+  ) +
+  theme_classic(base_size = 12, base_family = "Helvetica") +
+  theme(
+    axis.line       = element_line(size = 0.3, colour = "black"),
+    axis.text       = element_text(colour = "black"),
+    legend.position = "right"
+  )
+
+# 2. Explicitly print it
+print(p_bubble)
+
+```
+
+
+```{r}
+# … everything up through building expr_df as you had it …
+expr_df <- plot_df %>%
+  left_join(ligand_lookup,   by = "ligand")  %>%
+  left_join(receptor_lookup, by = "receptor") %>%
+  mutate(
+    ligand_delta   = ligand_sono  - ligand_non,
+    receptor_delta = receptor_sono - receptor_non,
+    size           = abs(delta_prob)
+  ) %>%
+  # ────────── HERE: drop the Non-sonicated rows ──────────
+  filter(driver == "Sonicated")
+
+```
+
+#Dot plot showing only the sonicated ligand-receptor pairs
+```{r}
+#Figure 2h
+
+p_bubble <- ggplot(expr_df, aes(x = ligand_delta, y = receptor_delta)) +
+  
+  # dashed zero reference lines
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  
+  # bubbles: size ∝ |Δ signalling score|, fixed pink fill
+  geom_point(aes(size = size),
+             shape = 21,
+             fill  = '#542788',
+             color = "black",
+             alpha = 0.4,
+             show.legend = c(size = TRUE, fill = FALSE)) +
+  
+  # labels for each LR pair
+  geom_text_repel(aes(label = interaction),
+                  size = 3.5,
+                  max.overlaps = 20,
+                  box.padding   = 0.3,
+                  point.padding = 0.5) +
+  
+  # size scale + legend
+  scale_size_continuous(
+    range  = c(4, 20),
+    name   = "Change in signalling strength\n(Sonicated – Non-sonicated)",
+    breaks = c(min(expr_df$size), median(expr_df$size), max(expr_df$size)),
+    labels = comma_format(accuracy = 0.0001)
+  ) +
+  
+  # axis padding so labels/bubbles don’t get clipped
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+  
+  # axis labels
+  labs(
+    x = "Change in ligand expression\n(logFC, Sonicated – Non-sonicated)",
+    y = "Change in receptor expression\n(logFC, Sonicated – Non-sonicated)"
+  ) +
+  
+  # classic theme + Helvetica
+  theme_classic(base_size = 12, base_family = "Helvetica") +
+  
+  # thin axes, black text, extra margin
+  theme(
+    axis.line       = element_line(size = 0.3, colour = "black"),
+    axis.text       = element_text(colour = "black"),
+    legend.position = "right",
+    legend.title    = element_text(size = 11),
+    legend.text     = element_text(size = 10),
+    plot.margin     = margin(t = 15, r = 15, b = 15, l = 15)
+  ) +
+  
+  # allow labels/bubbles to extend outside panel
+  coord_cartesian(clip = "off")
+
+print(p_bubble)
+
+```
+
+
+
+
+#Interactions from microglia to endothelial cells
+```{r}
+##–– 1. Keep only Microglia → Endothelial rows –––––––––––––––––––
+mg2endo <- df_diff %>% 
+  filter(source == "Microglia", target == "Endothelial")
+
+##–– take top 13 positive and top 13 negative Δprob ––––––––––
+top_up   <- mg2endo %>% arrange(dplyr::desc(delta_prob)) %>%  slice_head(n = 13)
+top_down <- mg2endo %>% arrange(     delta_prob) %>%  slice_head(n = 13)
+
+plot_df  <- bind_rows(top_up, top_down) %>% 
+  # order factor so bars plot top→bottom
+  mutate(interaction = factor(interaction, levels = rev(unique(interaction))))
+
+```
+
+```{r}
+plot_df <- plot_df %>% 
+  mutate(prob_non  = as.vector(cellchat_nonsonicated@net$prob[
+           "Microglia","Endothelial", interaction]),
+         prob_sono = as.vector(cellchat_sonicated@net$prob[
+           "Microglia","Endothelial", interaction]))
+
+```
+
+#Bar pplot
+```{r}
+#Figure 2e
+
+# --- 1. keep top 13 up & down ----------------------------------------
+mg2endo <- df_diff %>% 
+  filter(source == "Microglia", target == "Endothelial")
+
+plot_df <- bind_rows(
+  mg2endo %>% arrange(dplyr::desc(delta_prob)) %>% slice_head(n = 13),  # +Δ first
+  mg2endo %>% arrange(              delta_prob) %>% slice_head(n = 13)  # –Δ next
+) %>% 
+  mutate(interaction = forcats::fct_reorder(interaction, delta_prob, .desc = TRUE),
+         sign        = dplyr::if_else(delta_prob > 0, "Sonicated", "Non-sonicated"))
+
+
+# --- 2. bar plot -----------------------------------------------------
+ggplot(plot_df, aes(x = interaction, y = delta_prob, fill = sign)) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = c(
+    "Sonicated"     = '#542788',
+    "Non-sonicated" = "#00BCD4"
+  )) +
+  
+  # Force y-axis to plain numeric labels (no sci notation)
+  scale_y_continuous(
+  labels = function(x) format(x, scientific = FALSE, trim = TRUE),
+  expand = expansion(mult = c(0, 0.05))
+  ) +
+  
+  labs(
+    x    = NULL,
+    y    = "Change in signalling strength\n(Sonicated – Non-sonicated)",
+    fill = NULL
+  ) +
+  
+  theme_classic(base_size = 11, base_family = "Helvetica") +
+  theme(
+    axis.text.x     = element_text(angle = 45, size = 12, hjust = 1, colour = "black"),
+    axis.text.y     = element_text(size = 11, colour = "black"),
+    axis.title.y    = element_text(size = 13, colour = "black"),
+    axis.title      = element_text(colour = "black"),
+    legend.position = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line       = element_line(size = 0.3, colour = "black")
+  )
+```
+
+###Bubble plot
+```{r}
+# 1. Extract log-normalized RNA matrices
+rna_non  <- as.matrix(GetAssayData(seurat_nonsonicated, assay="RNA", slot="data"))
+rna_sono <- as.matrix(GetAssayData(seurat_sonicated,    assay="RNA", slot="data"))
+
+# 2. Helper to average expression for 1+ genes
+get_expr <- function(mat, genes, cells) {
+  genes <- intersect(genes, rownames(mat))
+  if (length(genes) == 0) return(NA_real_)
+  mean(mat[genes, cells, drop=FALSE])
+}
+
+# 3. Define cell sets
+mg_non    <- WhichCells(seurat_nonsonicated, expression = cell_phenotype=="Microglia")
+endo_non  <- WhichCells(seurat_nonsonicated, expression = cell_phenotype=="Endothelial")
+mg_sono   <- WhichCells(seurat_sonicated,    expression = cell_phenotype=="Microglia")
+endo_sono <- WhichCells(seurat_sonicated,    expression = cell_phenotype=="Endothelial")
+
+# 4. Pick top/bottom 15 interactions
+mg2endo <- df_diff %>% filter(source=="Microglia", target=="Endothelial")
+
+plot_df <- bind_rows(
+  mg2endo %>% dplyr::arrange(desc(delta_prob)) %>% slice_head(n=13),
+  mg2endo %>% dplyr::arrange(delta_prob)      %>% slice_head(n=13)
+) %>% 
+  mutate(
+    interaction = forcats::fct_reorder(interaction, delta_prob, .desc=TRUE),
+    driver      = if_else(delta_prob>0, "Sonicated","Non-sonicated")
+  )
+```
+
+
+```{r}
+## 1. Prep: get all unique ligand and receptor combos
+ligands   <- unique(plot_df$ligand)
+receptors <- unique(plot_df$receptor)
+
+# split out every subunit so we know which features to ask for
+all_lig_feats   <- unique(unlist(strsplit(ligands,   "_")))
+all_rec_feats   <- unique(unlist(strsplit(receptors, "_")))
+
+## 2. Compute average log‐normalized RNA@data by cell_phenotype & condition
+# Non-sonicated
+ae_non <- AverageExpression(
+  seurat_nonsonicated,
+  assays   = "RNA",
+  slot     = "data",
+  group.by = "cell_phenotype",
+  features = unique(c(all_lig_feats, all_rec_feats))
+)$RNA
+
+# Sonicated
+ae_sono <- AverageExpression(
+  seurat_sonicated,
+  assays   = "RNA",
+  slot     = "data",
+  group.by = "cell_phenotype",
+  features = unique(c(all_lig_feats, all_rec_feats))
+)$RNA
+
+## 3. Build a lookup table of ligand & receptor means
+get_mean <- function(ae_mat, gene_combo, celltype) {
+  genes <- strsplit(gene_combo, "_")[[1]]
+  genes <- intersect(genes, rownames(ae_mat))
+  if (length(genes) == 0) return(NA_real_)
+  mean(ae_mat[genes, celltype])
+}
+
+ligand_lookup <- tibble(
+  ligand = ligands,
+  ligand_non   = map_dbl(ligand, ~ get_mean(ae_non,   .x, "Microglia")),
+  ligand_sono  = map_dbl(ligand, ~ get_mean(ae_sono,  .x, "Microglia"))
+)
+
+receptor_lookup <- tibble(
+  receptor = receptors,
+  receptor_non   = map_dbl(receptor, ~ get_mean(ae_non,   .x, "Endothelial")),
+  receptor_sono  = map_dbl(receptor, ~ get_mean(ae_sono,  .x, "Endothelial"))
+)
+
+## 4. Merge back onto plot_df and compute deltas
+expr_df <- plot_df %>%
+  left_join(ligand_lookup,   by = "ligand")  %>%
+  left_join(receptor_lookup, by = "receptor") %>%
+  mutate(
+    ligand_delta   = ligand_sono  - ligand_non,
+    receptor_delta = receptor_sono - receptor_non,
+    size           = abs(delta_prob)
+  )
+
+## 5. Quick sanity-check
+print(dim(expr_df))           # should be 30 rows
+print(head(expr_df, 3)[, c( "ligand", "ligand_non","ligand_sono",
+                             "receptor","receptor_non","receptor_sono")])
+summary(expr_df[, c("ligand_non","ligand_sono","receptor_non","receptor_sono")])
+
+```
+
+
+```{r}
+# Define your pink/blue fills
+custom_cols <- c("Sonicated"     = '#542788',
+                 "Non-sonicated" = "#00BCD4")
+
+# 1. Build the ggplot object
+p_bubble <- ggplot(expr_df, aes(x = ligand_delta, y = receptor_delta)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_point(aes(size = size, fill = driver),
+             shape = 21, color = "black", alpha = 0.8) +
+  geom_text_repel(aes(label = interaction),
+                  size = 3, max.overlaps = 20) +
+  scale_fill_manual(values = custom_cols) +
+  scale_size_continuous(range = c(4, 12)) +
+  labs(
+    x    = "Δ ligand expression (Sonicated − Non-sonicated)",
+    y    = "Δ receptor expression (Sonicated − Non-sonicated)",
+    size = "|Δ signalling score|",
+    fill = "Driver"
+  ) +
+  theme_classic(base_size = 12, base_family = "Helvetica") +
+  theme(
+    axis.line       = element_line(size = 0.3, colour = "black"),
+    axis.text       = element_text(colour = "black"),
+    legend.position = "right"
+  )
+
+# 2. Explicitly print it
+print(p_bubble)
+
+```
+
+
+```{r}
+# … everything up through building expr_df as you had it …
+expr_df <- plot_df %>%
+  left_join(ligand_lookup,   by = "ligand")  %>%
+  left_join(receptor_lookup, by = "receptor") %>%
+  mutate(
+    ligand_delta   = ligand_sono  - ligand_non,
+    receptor_delta = receptor_sono - receptor_non,
+    size           = abs(delta_prob)
+  ) %>%
+  # ────────── HERE: drop the Non-sonicated rows ──────────
+  filter(driver == "Sonicated")
+
+```
+
+#Bubble plot showing only the sonicated ligand-receptor pairs
+```{r}
+#Figure 2f
+
+p_bubble <- ggplot(expr_df, aes(x = ligand_delta, y = receptor_delta)) +
+  
+  # dashed zero reference lines
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  
+  # bubbles: size ∝ |Δ signalling score|, fixed pink fill
+  geom_point(aes(size = size),
+             shape = 21,
+             fill  = '#542788',
+             color = "black",
+             alpha = 0.4,
+             show.legend = c(size = TRUE, fill = FALSE)) +
+  
+  # labels for each LR pair
+  geom_text_repel(aes(label = interaction),
+                  size = 3.5,
+                  max.overlaps = 20,
+                  box.padding   = 0.3,
+                  point.padding = 0.5) +
+  
+  # size scale + legend
+  scale_size_continuous(
+    range  = c(4, 20),
+    name   = "Change in signalling strength\n(Sonicated – Non-sonicated)",
+    breaks = c(min(expr_df$size), median(expr_df$size), max(expr_df$size)),
+    labels = comma_format(accuracy = 0.0001)
+  ) +
+  
+  # axis padding so labels/bubbles don’t get clipped
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+  
+  # axis labels
+  labs(
+    x = "Change in ligand expression\n(logFC, Sonicated – Non-sonicated)",
+    y = "Change in receptor expression\n(logFC, Sonicated – Non-sonicated)"
+  ) +
+  
+  # classic theme + Helvetica
+  theme_classic(base_size = 12, base_family = "Helvetica") +
+  
+  # thin axes, black text, extra margin
+  theme(
+    axis.line       = element_line(size = 0.3, colour = "black"),
+    axis.text       = element_text(colour = "black"),
+    legend.position = "right",
+    legend.title    = element_text(size = 11),
+    legend.text     = element_text(size = 10),
+    plot.margin     = margin(t = 15, r = 15, b = 15, l = 15)
+  ) +
+  
+  # allow labels/bubbles to extend outside panel
+  coord_cartesian(clip = "off")
+
+print(p_bubble)
+
+
+```
+
+
+
+#Interactions from endothelial cells to microglia
+```{r}
+##–– 1. Keep only Endothelial → Microglia rows –––––––––––––––––––
+endo2mg <- df_diff %>% 
+  filter(source == "Endothelial", target == "Microglia")
+
+##–– take top 15 positive and top 15 negative Δprob ––––––––––
+top_up   <- endo2mg %>% arrange(dplyr::desc(delta_prob)) %>%  slice_head(n = 13)
+top_down <- endo2mg %>% arrange(     delta_prob) %>%  slice_head(n = 13)
+
+plot_df  <- bind_rows(top_up, top_down) %>% 
+  # order factor so bars plot top→bottom
+  mutate(interaction = factor(interaction, levels = rev(unique(interaction))))
+
+```
+
+```{r}
+plot_df <- plot_df %>% 
+  mutate(prob_non  = as.vector(cellchat_nonsonicated@net$prob[
+           "Endothelial","Microglia", interaction]),
+         prob_sono = as.vector(cellchat_sonicated@net$prob[
+           "Endothelial","Microglia", interaction]))
+
+```
+
+#Bar pplot
+```{r}
+#Extended Data Figure 5d
+
+# --- 1. keep top 13 up & down ----------------------------------------
+endo2mg <- df_diff %>% 
+  filter(source == "Endothelial", target == "Microglia")
+
+plot_df <- bind_rows(
+  endo2mg %>% arrange(dplyr::desc(delta_prob)) %>% slice_head(n = 13),  # +Δ first
+  endo2mg %>% arrange(              delta_prob) %>% slice_head(n = 13)  # –Δ next
+) %>% 
+  mutate(interaction = forcats::fct_reorder(interaction, delta_prob, .desc = TRUE),
+         sign        = dplyr::if_else(delta_prob > 0, "Sonicated", "Non-sonicated"))
+
+
+# --- 2. bar plot -----------------------------------------------------
+ggplot(plot_df, aes(x = interaction, y = delta_prob, fill = sign)) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = c(
+    "Sonicated"     = '#542788',
+    "Non-sonicated" = "#00BCD4"
+  )) +
+  
+  # Force y-axis to plain numeric labels (no sci notation)
+  scale_y_continuous(
+  labels = function(x) format(x, scientific = FALSE, trim = TRUE),
+  expand = expansion(mult = c(0, 0.05))
+  ) +
+  
+  labs(
+    x    = NULL,
+    y    = "Change in signalling strength\n(Sonicated – Non-sonicated)",
+    fill = NULL
+  ) +
+  
+  theme_classic(base_size = 11, base_family = "Helvetica") +
+  theme(
+    axis.text.x     = element_text(angle = 45, size = 12, hjust = 1, colour = "black"),
+    axis.text.y     = element_text(size = 11, colour = "black"),
+    axis.title.y    = element_text(size = 13, colour = "black"),
+    axis.title      = element_text(colour = "black"),
+    legend.position = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line       = element_line(size = 0.3, colour = "black")
+  )
+```
+
+###Bubble plot## This is working to show the Sonicated and Non-sonicated groups
+```{r}
+# 1. Extract log-normalized RNA matrices
+rna_non  <- as.matrix(GetAssayData(seurat_nonsonicated, assay="RNA", slot="data"))
+rna_sono <- as.matrix(GetAssayData(seurat_sonicated,    assay="RNA", slot="data"))
+
+# 2. Helper to average expression for 1+ genes
+get_expr <- function(mat, genes, cells) {
+  genes <- intersect(genes, rownames(mat))
+  if (length(genes) == 0) return(NA_real_)
+  mean(mat[genes, cells, drop=FALSE])
+}
+
+# 3. Define cell sets
+mg_non    <- WhichCells(seurat_nonsonicated, expression = cell_phenotype=="Microglia")
+endo_non  <- WhichCells(seurat_nonsonicated, expression = cell_phenotype=="Endothelial")
+mg_sono   <- WhichCells(seurat_sonicated,    expression = cell_phenotype=="Microglia")
+endo_sono <- WhichCells(seurat_sonicated,    expression = cell_phenotype=="Endothelial")
+
+# 4. Pick top/bottom 15 interactions
+endo2mg <- df_diff %>% 
+  filter(source == "Endothelial", target == "Microglia")
+
+plot_df <- bind_rows(
+  endo2mg %>% dplyr::arrange(desc(delta_prob)) %>% slice_head(n=15),
+  endo2mg %>% dplyr::arrange(delta_prob)      %>% slice_head(n=15)
+) %>% 
+  mutate(
+    interaction = forcats::fct_reorder(interaction, delta_prob, .desc=TRUE),
+    driver      = if_else(delta_prob>0, "Sonicated","Non-sonicated")
+  )
+```
+
+
+
+```{r}
+## 1. Prep: get all unique ligand and receptor combos
+ligands   <- unique(plot_df$ligand)
+receptors <- unique(plot_df$receptor)
+
+# split out every subunit so we know which features to ask for
+all_lig_feats   <- unique(unlist(strsplit(ligands,   "_")))
+all_rec_feats   <- unique(unlist(strsplit(receptors, "_")))
+
+## 2. Compute average log‐normalized RNA@data by cell_phenotype & condition
+# Non-sonicated
+ae_non <- AverageExpression(
+  seurat_nonsonicated,
+  assays   = "RNA",
+  slot     = "data",
+  group.by = "cell_phenotype",
+  features = unique(c(all_lig_feats, all_rec_feats))
+)$RNA
+
+# Sonicated
+ae_sono <- AverageExpression(
+  seurat_sonicated,
+  assays   = "RNA",
+  slot     = "data",
+  group.by = "cell_phenotype",
+  features = unique(c(all_lig_feats, all_rec_feats))
+)$RNA
+
+## 3. Build a lookup table of ligand & receptor means
+get_mean <- function(ae_mat, gene_combo, celltype) {
+  genes <- strsplit(gene_combo, "_")[[1]]
+  genes <- intersect(genes, rownames(ae_mat))
+  if (length(genes) == 0) return(NA_real_)
+  mean(ae_mat[genes, celltype])
+}
+
+ligand_lookup <- tibble(
+  ligand = ligands,
+  ligand_non   = map_dbl(ligand, ~ get_mean(ae_non,   .x, "Microglia")),
+  ligand_sono  = map_dbl(ligand, ~ get_mean(ae_sono,  .x, "Microglia"))
+)
+
+receptor_lookup <- tibble(
+  receptor = receptors,
+  receptor_non   = map_dbl(receptor, ~ get_mean(ae_non,   .x, "Endothelial")),
+  receptor_sono  = map_dbl(receptor, ~ get_mean(ae_sono,  .x, "Endothelial"))
+)
+
+## 4. Merge back onto plot_df and compute deltas
+expr_df <- plot_df %>%
+  left_join(ligand_lookup,   by = "ligand")  %>%
+  left_join(receptor_lookup, by = "receptor") %>%
+  mutate(
+    ligand_delta   = ligand_sono  - ligand_non,
+    receptor_delta = receptor_sono - receptor_non,
+    size           = abs(delta_prob)
+  )
+
+## 5. Quick sanity-check
+print(dim(expr_df))           # should be 30 rows
+print(head(expr_df, 3)[, c( "ligand", "ligand_non","ligand_sono",
+                             "receptor","receptor_non","receptor_sono")])
+summary(expr_df[, c("ligand_non","ligand_sono","receptor_non","receptor_sono")])
+
+```
+
+
+```{r}
+# Define your pink/blue fills
+custom_cols <- c("Sonicated"     = '#542788',
+                 "Non-sonicated" = "#00BCD4")
+
+# 1. Build the ggplot object
+p_bubble <- ggplot(expr_df, aes(x = ligand_delta, y = receptor_delta)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_point(aes(size = size, fill = driver),
+             shape = 21, color = "black", alpha = 0.8) +
+  geom_text_repel(aes(label = interaction),
+                  size = 3, max.overlaps = 20) +
+  scale_fill_manual(values = custom_cols) +
+  scale_size_continuous(range = c(4, 12)) +
+  labs(
+    x    = "Δ ligand expression (Sonicated − Non-sonicated)",
+    y    = "Δ receptor expression (Sonicated − Non-sonicated)",
+    size = "|Δ signalling score|",
+    fill = "Driver"
+  ) +
+  theme_classic(base_size = 12, base_family = "Helvetica") +
+  theme(
+    axis.line       = element_line(size = 0.3, colour = "black"),
+    axis.text       = element_text(colour = "black"),
+    legend.position = "right"
+  )
+
+# 2. Explicitly print it
+print(p_bubble)
+
+```
+
+
+```{r}
+expr_df <- plot_df %>%
+  left_join(ligand_lookup,   by = "ligand")  %>%
+  left_join(receptor_lookup, by = "receptor") %>%
+  mutate(
+    ligand_delta   = ligand_sono  - ligand_non,
+    receptor_delta = receptor_sono - receptor_non,
+    size           = abs(delta_prob)
+  ) %>%
+  # ────────── HERE: drop the Non-sonicated rows ──────────
+  filter(driver == "Sonicated")
+
+```
+
+#Dot plot showing only the sonicated ligand-receptor pairs
+```{r}
+#Extended Data Figure 5e
+
+p_bubble <- ggplot(expr_df, aes(x = ligand_delta, y = receptor_delta)) +
+  
+  # dashed zero reference lines
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  
+  # bubbles: size ∝ |Δ signalling score|, fixed pink fill
+  geom_point(aes(size = size),
+             shape = 21,
+             fill  = '#542788',
+             color = "black",
+             alpha = 0.4,
+             show.legend = c(size = TRUE, fill = FALSE)) +
+  
+  # labels for each LR pair
+  geom_text_repel(aes(label = interaction),
+                  size = 3.5,
+                  max.overlaps = 20,
+                  box.padding   = 0.3,
+                  point.padding = 0.5) +
+  
+  # size scale + legend
+  scale_size_continuous(
+    range  = c(4, 20),
+    name   = "Change in signalling strength\n(Sonicated – Non-sonicated)",
+    breaks = c(min(expr_df$size), median(expr_df$size), max(expr_df$size)),
+    labels = comma_format(accuracy = 0.0001)
+  ) +
+  
+  # axis padding so labels/bubbles don’t get clipped
+  scale_y_continuous(expand = expansion(mult = c(0.15, 0.15))) +
+  scale_x_continuous(expand = expansion(mult = c(0.15, 0.05))) +
+  
+  # axis labels
+  labs(
+    x = "Change in ligand expression\n(logFC, Sonicated – Non-sonicated)",
+    y = "Change in receptor expression\n(logFC, Sonicated – Non-sonicated)"
+  ) +
+  
+  # classic theme + Helvetica
+  theme_classic(base_size = 12, base_family = "Helvetica") +
+  
+  # thin axes, black text, extra margin
+  theme(
+    axis.line       = element_line(size = 0.3, colour = "black"),
+    axis.text       = element_text(colour = "black"),
+    legend.position = "right",
+    legend.title    = element_text(size = 11),
+    legend.text     = element_text(size = 10),
+    plot.margin     = margin(t = 15, r = 15, b = 15, l = 15)
+  ) +
+  
+  # allow labels/bubbles to extend outside panel
+  coord_cartesian(clip = "off")
+
+print(p_bubble)
+```
+
+
+
+
+
+#Interactions from Macrophages to Endothelial cells
+```{r}
+##–– 1. Keep only Macrophages → Endothelial rows –––––––––––––––––––
+mac2endo <- df_diff %>% 
+  filter(source == "Macrophage", target == "Endothelial")
+
+##–– take top 15 positive and top 15 negative Δprob ––––––––––
+top_up   <- mac2endo %>% arrange(dplyr::desc(delta_prob)) %>%  slice_head(n = 15)
+top_down <- mac2endo %>% arrange(     delta_prob) %>%  slice_head(n = 15)
+
+plot_df  <- bind_rows(top_up, top_down) %>% 
+  # order factor so bars plot top→bottom
+  mutate(interaction = factor(interaction, levels = rev(unique(interaction))))
+
+```
+
+```{r}
+plot_df <- plot_df %>% 
+  mutate(prob_non  = as.vector(cellchat_nonsonicated@net$prob[
+           "Macrophage","Endothelial", interaction]),
+         prob_sono = as.vector(cellchat_sonicated@net$prob[
+           "Macrophage","Endothelial", interaction]))
+
+```
+
+#Bar pplot
+```{r}
+# --- 1. keep top 15 up & down ----------------------------------------
+mac2endo <- df_diff %>% 
+  filter(source == "Macrophage", target == "Endothelial")
+
+plot_df <- bind_rows(
+  mac2endo %>% arrange(dplyr::desc(delta_prob)) %>% slice_head(n = 15),  # +Δ first
+  mac2endo %>% arrange(              delta_prob) %>% slice_head(n = 15)  # –Δ next
+) %>% 
+  mutate(interaction = forcats::fct_reorder(interaction, delta_prob, .desc = TRUE),
+         sign        = dplyr::if_else(delta_prob > 0, "Sonicated", "Non-sonicated"))
+
+```
+
+```{r}
+#Extended Data Figure 5b
+
+# --- 2. bar plot -----------------------------------------------------
+ggplot(plot_df, aes(x = interaction, y = delta_prob, fill = sign)) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = c(
+    "Sonicated"     = '#542788',
+    "Non-sonicated" = "#00BCD4"
+  )) +
+  
+  # Force y-axis to plain numeric labels (no sci notation)
+  scale_y_continuous(
+  labels = function(x) format(x, scientific = FALSE, trim = TRUE),
+  expand = expansion(mult = c(0, 0.05))
+  ) +
+  
+  labs(
+    x    = NULL,
+    y    = "Change in signalling strength\n(Sonicated – Non-sonicated)",
+    fill = NULL
+  ) +
+  
+  theme_classic(base_size = 11, base_family = "Helvetica") +
+  theme(
+    axis.text.x     = element_text(angle = 45, size = 12, hjust = 1, colour = "black"),
+    axis.text.y     = element_text(size = 11, colour = "black"),
+    axis.title.y    = element_text(size = 13, colour = "black"),
+    axis.title      = element_text(colour = "black"),
+    legend.position = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line       = element_line(size = 0.3, colour = "black")
+  )
+```
+
+###Bubble plot## This is working to show the Sonicated and Non-sonicated groups
+```{r}
+# 1. Extract log-normalized RNA matrices
+rna_non  <- as.matrix(GetAssayData(seurat_nonsonicated, assay="RNA", slot="data"))
+rna_sono <- as.matrix(GetAssayData(seurat_sonicated,    assay="RNA", slot="data"))
+
+# 2. Helper to average expression for 1+ genes
+get_expr <- function(mat, genes, cells) {
+  genes <- intersect(genes, rownames(mat))
+  if (length(genes) == 0) return(NA_real_)
+  mean(mat[genes, cells, drop=FALSE])
+}
+
+# 3. Define cell sets
+mac_non    <- WhichCells(seurat_nonsonicated, expression = cell_phenotype=="Macrophage")
+endo_non  <- WhichCells(seurat_nonsonicated, expression = cell_phenotype=="Endothelial")
+mac_sono   <- WhichCells(seurat_sonicated,    expression = cell_phenotype=="Macrophage")
+endo_sono <- WhichCells(seurat_sonicated,    expression = cell_phenotype=="Endothelial")
+
+# 4. Pick top/bottom 15 interactions
+mac2endo <- df_diff %>% filter(source=="Macrophage", target=="Endothelial")
+
+plot_df <- bind_rows(
+  mac2endo %>% dplyr::arrange(desc(delta_prob)) %>% slice_head(n=15),
+  mac2endo %>% dplyr::arrange(delta_prob)      %>% slice_head(n=15)
+) %>% 
+  mutate(
+    interaction = forcats::fct_reorder(interaction, delta_prob, .desc=TRUE),
+    driver      = if_else(delta_prob>0, "Sonicated","Non-sonicated")
+  )
+```
+
+
+```{r}
+## 1. Prep: get all unique ligand and receptor combos
+ligands   <- unique(plot_df$ligand)
+receptors <- unique(plot_df$receptor)
+
+# split out every subunit so we know which features to ask for
+all_lig_feats   <- unique(unlist(strsplit(ligands,   "_")))
+all_rec_feats   <- unique(unlist(strsplit(receptors, "_")))
+
+## 2. Compute average log‐normalized RNA@data by cell_phenotype & condition
+# Non-sonicated
+ae_non <- AverageExpression(
+  seurat_nonsonicated,
+  assays   = "RNA",
+  slot     = "data",
+  group.by = "cell_phenotype",
+  features = unique(c(all_lig_feats, all_rec_feats))
+)$RNA
+
+# Sonicated
+ae_sono <- AverageExpression(
+  seurat_sonicated,
+  assays   = "RNA",
+  slot     = "data",
+  group.by = "cell_phenotype",
+  features = unique(c(all_lig_feats, all_rec_feats))
+)$RNA
+
+## 3. Build a lookup table of ligand & receptor means
+get_mean <- function(ae_mat, gene_combo, celltype) {
+  genes <- strsplit(gene_combo, "_")[[1]]
+  genes <- intersect(genes, rownames(ae_mat))
+  if (length(genes) == 0) return(NA_real_)
+  mean(ae_mat[genes, celltype])
+}
+
+ligand_lookup <- tibble(
+  ligand = ligands,
+  ligand_non   = map_dbl(ligand, ~ get_mean(ae_non,   .x, "Macrophage")),
+  ligand_sono  = map_dbl(ligand, ~ get_mean(ae_sono,  .x, "Macrophage"))
+)
+
+receptor_lookup <- tibble(
+  receptor = receptors,
+  receptor_non   = map_dbl(receptor, ~ get_mean(ae_non,   .x, "Endothelial")),
+  receptor_sono  = map_dbl(receptor, ~ get_mean(ae_sono,  .x, "Endothelial"))
+)
+
+## 4. Merge back onto plot_df and compute deltas
+expr_df <- plot_df %>%
+  left_join(ligand_lookup,   by = "ligand")  %>%
+  left_join(receptor_lookup, by = "receptor") %>%
+  mutate(
+    ligand_delta   = ligand_sono  - ligand_non,
+    receptor_delta = receptor_sono - receptor_non,
+    size           = abs(delta_prob)
+  )
+
+## 5. Quick sanity-check
+print(dim(expr_df))           # should be 30 rows
+print(head(expr_df, 3)[, c( "ligand", "ligand_non","ligand_sono",
+                             "receptor","receptor_non","receptor_sono")])
+summary(expr_df[, c("ligand_non","ligand_sono","receptor_non","receptor_sono")])
+
+```
+
+
+```{r}
+# Define your pink/blue fills
+custom_cols <- c("Sonicated"     = '#542788',
+                 "Non-sonicated" = "#00BCD4")
+
+# 1. Build the ggplot object
+p_bubble <- ggplot(expr_df, aes(x = ligand_delta, y = receptor_delta)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_point(aes(size = size, fill = driver),
+             shape = 21, color = "black", alpha = 0.8) +
+  geom_text_repel(aes(label = interaction),
+                  size = 3, max.overlaps = 20) +
+  scale_fill_manual(values = custom_cols) +
+  scale_size_continuous(range = c(4, 12)) +
+  labs(
+    x    = "Δ ligand expression (Sonicated − Non-sonicated)",
+    y    = "Δ receptor expression (Sonicated − Non-sonicated)",
+    size = "|Δ signalling score|",
+    fill = "Driver"
+  ) +
+  theme_classic(base_size = 12, base_family = "Helvetica") +
+  theme(
+    axis.line       = element_line(size = 0.3, colour = "black"),
+    axis.text       = element_text(colour = "black"),
+    legend.position = "right"
+  )
+
+# 2. Explicitly print it
+print(p_bubble)
+
+```
+
+
+```{r}
+expr_df <- plot_df %>%
+  left_join(ligand_lookup,   by = "ligand")  %>%
+  left_join(receptor_lookup, by = "receptor") %>%
+  mutate(
+    ligand_delta   = ligand_sono  - ligand_non,
+    receptor_delta = receptor_sono - receptor_non,
+    size           = abs(delta_prob)
+  ) %>%
+  # ────────── HERE: drop the Non-sonicated rows ──────────
+  filter(driver == "Sonicated")
+
+```
+
+#Dot plot showing only the sonicated ligand-receptor pairs
+```{r}
+#Extended Data Figure 5c
+
+p_bubble <- ggplot(expr_df, aes(x = ligand_delta, y = receptor_delta)) +
+  
+  # dashed zero reference lines
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  
+  # bubbles: size ∝ |Δ signalling score|, fixed pink fill
+  geom_point(aes(size = size),
+             shape = 21,
+             fill  = '#542788',
+             color = "black",
+             alpha = 0.4,
+             show.legend = c(size = TRUE, fill = FALSE)) +
+  
+  # labels for each LR pair
+  geom_text_repel(aes(label = interaction),
+                  size = 3.5,
+                  max.overlaps = 20,
+                  box.padding   = 0.3,
+                  point.padding = 0.5) +
+  
+  # size scale + legend
+  scale_size_continuous(
+    range  = c(4, 20),
+    name   = "Change in signalling strength\n(Sonicated – Non-sonicated)",
+    breaks = c(min(expr_df$size), median(expr_df$size), max(expr_df$size)),
+    labels = comma_format(accuracy = 0.0001)
+  ) +
+  
+  # axis padding so labels/bubbles don’t get clipped
+  scale_x_continuous(expand = expansion(add = c(0.1, 0.1))) +
+  scale_y_continuous(expand = expansion(add = c(0.1, 0.1))) +
+  
+  # axis labels
+  labs(
+    x = "Change in ligand expression\n(Sonicated – Non-sonicated)",
+    y = "Change in receptor expression\n(Sonicated – Non-sonicated)"
+  ) +
+  
+  # classic theme + Helvetica
+  theme_classic(base_size = 12, base_family = "Helvetica") +
+  
+  # thin axes, black text, extra margin
+  theme(
+    axis.line       = element_line(size = 0.3, colour = "black"),
+    axis.text       = element_text(colour = "black"),
+    legend.position = "right",
+    legend.title    = element_text(size = 11),
+    legend.text     = element_text(size = 10),
+    plot.margin     = margin(t = 15, r = 15, b = 15, l = 15)
+  ) +
+  
+  # allow labels/bubbles to extend outside panel
+  coord_cartesian(clip = "off")
+
+print(p_bubble)
+
+```
+

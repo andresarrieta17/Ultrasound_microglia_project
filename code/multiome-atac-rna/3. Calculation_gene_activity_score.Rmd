@@ -1,0 +1,198 @@
+---
+title: "3. Calculation_gene_activity_score"
+author: "Victor A. Arrieta"
+date: "2025-08-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+set.seed(33)
+
+# Core deps
+library(ArchR)
+library(SummarizedExperiment)
+library(ComplexHeatmap)
+library(dplyr)
+
+# (Optional) if you use colorRamp2 elsewhere
+# library(circlize)
+
+```
+
+#Marker detection from RNA (GeneExpressionMatrix) and ATAC (GeneScoreMatrix)
+```{r}
+# Compute marker features for RNA (scRNA-seq)
+RNA_features_celltypes <- getMarkerFeatures(
+  ArchRProj = projatac_filtered_with_RNA,
+  useMatrix  = "GeneExpressionMatrix",
+  groupBy    = "celltype_simple",         
+  bias       = "log10(Gex_nUMI)",
+  testMethod = "wilcoxon"
+)
+
+# Compute marker features for ATAC (gene scores)
+ATAC_features_celltypes <- getMarkerFeatures(
+  ArchRProj = projatac_filtered_with_RNA,
+  useMatrix  = "GeneScoreMatrix",
+  groupBy    = "celltype_simple",
+  bias       = c("log10(nFrags)", "TSSEnrichment"),
+  testMethod = "wilcoxon"
+)
+```
+
+#Build a unified feature list (top RNA markers)
+```{r}
+markersList <- getMarkers(
+  seMarker = RNA_features_celltypes,
+  cutOff   = "FDR <= 0.01 & Log2FC >= 0.5"
+)
+topPerGroup <- lapply(markersList, function(df) head(df$name, 500))
+geneList     <- unique(unlist(topPerGroup))[1:1050]
+
+```
+
+#Keep only genes present in both assays
+```{r}
+commonGenes <- intersect(
+  geneList,
+  intersect(
+    rowData(RNA_features_celltypes)$name,
+    rowData(ATAC_features_celltypes)$name
+  )
+)
+
+# Get the original row‐indices for those genes
+rowIdxRNA  <- match(commonGenes, rowData(RNA_features_celltypes)$name)
+rowIdxATAC <- match(commonGenes, rowData(ATAC_features_celltypes)$name)
+
+# Subset the SummarizedExperiments to those genes
+seRNA_sub  <- RNA_features_celltypes[rowIdxRNA, ]
+seATAC_sub <- ATAC_features_celltypes[rowIdxATAC, ]
+
+# Define your desired cell-type column order
+desiredOrder <- c(
+  "Glutamatergic", "GABAergic", "OPC", "Astrocytes",
+  "Oligodendrocytes", "T cells", "Monocytes", "Microglia",
+  "Macrophages", "Dendritic cells"
+)
+
+# Re-order columns in both SE objects
+colIdxRNA    <- match(desiredOrder, colnames(seRNA_sub))
+seRNA_order  <- seRNA_sub[, colIdxRNA]
+
+colIdxATAC   <- match(desiredOrder, colnames(seATAC_sub))
+seATAC_order <- seATAC_sub[, colIdxATAC]
+```
+
+#Subset SEs and order columns consistently
+```{r}
+seRNA_sub  <- RNA_features_celltypes[rowIdxRNA, ]
+seATAC_sub <- ATAC_features_celltypes[rowIdxATAC, ]
+
+desiredOrder <- c(
+  "Glutamatergic","GABAergic","OPC","Astrocytes",
+  "Oligodendrocytes","T cells","Monocytes","Microglia",
+  "Macrophages","Dendritic cells"
+)
+
+# Keep only the categories that exist
+keepRNA  <- desiredOrder[desiredOrder %in% colnames(seRNA_sub)]
+keepATAC <- desiredOrder[desiredOrder %in% colnames(seATAC_sub)]
+
+seRNA_order  <- seRNA_sub[, keepRNA, drop=FALSE]
+seATAC_order <- seATAC_sub[, keepATAC, drop=FALSE]
+
+# Quick guards
+stopifnot(nrow(seRNA_order)  > 0, ncol(seRNA_order)  > 0)
+stopifnot(nrow(seATAC_order) > 0, ncol(seATAC_order) > 0)
+
+```
+
+```{r}
+# Plot RNA heatmap with blueYellow palette
+heatmap_RNA <- plotMarkerHeatmap(
+  seMarker          = seRNA_order,
+  subsetMarkers     = NULL,                   # already subset above
+  scaleRows         = TRUE,                   # row-z-scores
+  pal               = paletteContinuous("blueYellow"),
+  nLabel            = 0,                      # no gene labels
+  binaryClusterRows = TRUE,                   # cluster rows (genes)
+  clusterCols       = FALSE,                  # preserve our column order
+  transpose         = TRUE,                   # genes on y, celltypes on x
+  limits            = c(-2, 2)
+)
+
+# Plot ATAC heatmap with horizonExtra palette
+heatmap_ATAC <- plotMarkerHeatmap(
+  seMarker          = seATAC_order,
+  subsetMarkers     = NULL,
+  scaleRows         = TRUE,
+  pal               = paletteContinuous("horizonExtra"),
+  nLabel            = 0,
+  binaryClusterRows = TRUE,
+  clusterCols       = FALSE,
+  transpose         = TRUE,
+  limits            = c(-2, 2)
+)
+```
+
+
+```{r}
+#Extended Data Figure 7b
+
+combined_ht <- heatmap_RNA + heatmap_ATAC
+
+draw(
+  combined_ht,
+  heatmap_legend_side    = "bottom",
+  annotation_legend_side = "bottom"
+)
+dev.off()
+
+draw(heatmap_ATAC, heatmap_legend_side="bottom", annotation_legend_side="bottom")
+dev.off()
+
+draw(heatmap_RNA, heatmap_legend_side="bottom", annotation_legend_side="bottom")
+dev.off()
+
+```
+
+
+#Plot Gene Scores on UMAP without imputation
+```{r}
+#Extended Data Figure 7c
+
+# Overlay gene scores on UMAP for multiome data (without imputation)
+markerGenes <- c("P2RY12", "TMEM119", "CX3CR1")  # Example marker genes
+
+p <- plotEmbedding(
+    ArchRProj = projatac_filtered_with_RNA,
+    colorBy = "GeneScoreMatrix",
+    name = markerGenes,
+    embedding = "UMAP_Harmony_combined",  # UMAP after Harmony correction
+    quantCut = c(0.01, 0.95),  # Quantile cutoffs for visualization
+    plotAs = "points",
+    size = 0.5,
+    imputeWeights = NULL  # Without imputation initially
+)
+
+# Display the UMAP plot
+print(p)
+
+
+#To plot the RNA plots
+p <- plotEmbedding(
+    ArchRProj = projatac_filtered_with_RNA, 
+    colorBy = "GeneExpressionMatrix", 
+    name = markerGenes, 
+    embedding = "UMAP_Harmony_combined",
+    plotAs = "points",
+    size = 0.5,
+    imputeWeights = NULL
+)
+
+# Display the UMAP plot
+print(p)
+```

@@ -1,0 +1,330 @@
+---
+title: "7. Visualization of the DEG results"
+author: "Victor A. Arrieta"
+date: "2025-08-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ArchR)
+
+# Blue→yellow gradient for DotPlot
+colors_blueYellow <- ArchRPalettes$blueYellow
+```
+
+#Dot plot for microglia DEG
+```{r}
+#Figure 1g
+
+# Load DEG table (microglia)
+deg_results <- read.csv("DEG_results_sonicated_vs_nonsonicated_microglia.csv", stringsAsFactors = FALSE)
+
+# Top/bottom 20 by Wilcoxon statistic
+top20    <- head(deg_results[order(deg_results$wilcoxon_statistic, decreasing = TRUE), ], 20)
+bottom20 <- head(deg_results[order(deg_results$wilcoxon_statistic, decreasing = FALSE), ], 20)
+selected_genes <- unique(c(top20$gene, bottom20$gene))
+
+# Order genes (desc by statistic)
+ordered_genes <- deg_results %>%
+  filter(gene %in% selected_genes) %>%
+  arrange(desc(wilcoxon_statistic)) %>%
+  pull(gene)
+
+DefaultAssay(Microglia_filtered) <- "SCT"
+Microglia_filtered$orig.ident <- factor(Microglia_filtered$orig.ident, levels = c("Non-sonicated", "Sonicated"))
+
+dot_plot <- DotPlot(
+  Microglia_filtered,
+  features = ordered_genes,
+  group.by = "orig.ident",
+  assay = "SCT",
+  dot.scale = 8
+) +
+  scale_color_gradientn(colors = colors_blueYellow, name = "Scaled Expression\n(z-scores)") +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, family = "Helvetica", face = "italic"),
+    axis.text.y = element_text(size = 14, family = "Helvetica"),
+    text        = element_text(family = "Helvetica"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.title = element_text(family = "Helvetica")
+  )
+
+# add thin black stroke around dots
+dot_plot <- dot_plot +
+  geom_point(
+    data = dot_plot$data,
+    mapping = aes(x = features.plot, y = id, size = pct.exp),
+    shape = 21, fill = NA, color = "black", stroke = 0.5
+  )
+
+print(dot_plot)
+
+```
+
+```{r}
+#Figure 1g
+
+# Reuse deg_results
+top20$group    <- "up"
+bottom20$group <- "down"
+bar_data <- dplyr::bind_rows(top20, bottom20)
+
+ordered_genes <- deg_results %>%
+  filter(gene %in% unique(bar_data$gene)) %>%
+  arrange(desc(wilcoxon_statistic)) %>%
+  pull(gene)
+bar_data$gene <- factor(bar_data$gene, levels = ordered_genes)
+
+ggplot(bar_data, aes(x = gene, y = wilcoxon_statistic, fill = group)) +
+  geom_col() +
+  scale_fill_manual(values = c("up" = "#01747a", "down" = "#01747a")) +
+  labs(x = "Gene", y = "Wilcoxon\nStatistic") +
+  theme_bw() +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, family = "Helvetica", color = "black"),
+    axis.text.y = element_text(family = "Helvetica", color = "black"),
+    axis.title  = element_text(family = "Helvetica", color = "black"),
+    legend.text = element_text(family = "Helvetica", color = "black"),
+    legend.title= element_text(family = "Helvetica", color = "black")
+  )
+
+```
+
+#Dot plot for macrophages DEG
+```{r}
+#Extended Data Figure 3a
+
+deg_results <- read.csv("DEG_results_sonicated_vs_nonsonicated_macrophages.csv", stringsAsFactors = FALSE)
+
+top20    <- head(deg_results[order(deg_results$wilcoxon_statistic, decreasing = TRUE), ], 20)
+bottom20 <- head(deg_results[order(deg_results$wilcoxon_statistic, decreasing = FALSE), ], 20)
+selected_genes <- unique(c(top20$gene, bottom20$gene))
+
+ordered_genes <- deg_results %>%
+  filter(gene %in% selected_genes) %>%
+  arrange(desc(wilcoxon_statistic)) %>%
+  pull(gene)
+
+DefaultAssay(Macrophages) <- "SCT"
+Macrophages$orig.ident <- factor(Macrophages$orig.ident, levels = c("Non-sonicated", "Sonicated"))
+
+dot_plot <- DotPlot(
+  Macrophages,
+  features = ordered_genes,
+  group.by = "orig.ident",
+  assay = "SCT",
+  dot.scale = 8
+) +
+  scale_color_gradientn(colors = colors_blueYellow, name = "Scaled Expression\n(z-scores)") +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, family = "Helvetica", face = "italic"),
+    axis.text.y = element_text(size = 14, family = "Helvetica"),
+    text        = element_text(family = "Helvetica"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.title = element_text(family = "Helvetica")
+  )
+
+dot_plot <- dot_plot +
+  geom_point(
+    data = dot_plot$data,
+    mapping = aes(x = features.plot, y = id, size = pct.exp),
+    shape = 21, fill = NA, color = "black", stroke = 0.5
+  )
+
+print(dot_plot)
+
+```
+
+```{r}
+#Extended Data Figure 3a
+
+top20$group    <- "up"
+bottom20$group <- "down"
+bar_data <- dplyr::bind_rows(top20, bottom20)
+
+ordered_genes <- deg_results %>%
+  filter(gene %in% unique(bar_data$gene)) %>%
+  arrange(desc(wilcoxon_statistic)) %>%
+  pull(gene)
+bar_data$gene <- factor(bar_data$gene, levels = ordered_genes)
+
+ggplot(bar_data, aes(x = gene, y = wilcoxon_statistic, fill = group)) +
+  geom_col() +
+  scale_fill_manual(values = c("up" = "#01747a", "down" = "#01747a")) +
+  labs(x = "Gene", y = "Wilcoxon\nStatistic") +
+  theme_bw() +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, family = "Helvetica", color = "black"),
+    axis.text.y = element_text(family = "Helvetica", color = "black"),
+    axis.title  = element_text(family = "Helvetica", color = "black"),
+    legend.text = element_text(family = "Helvetica", color = "black"),
+    legend.title= element_text(family = "Helvetica", color = "black")
+  )
+
+```
+
+#Dot plot for monocytes DEG
+```{r}
+#Extended Data Figure 3c
+
+deg_results <- read.csv("DEG_results_sonicated_vs_nonsonicated_monocytes.csv", stringsAsFactors = FALSE)
+
+top20    <- head(deg_results[order(deg_results$wilcoxon_statistic, decreasing = TRUE), ], 20)
+bottom20 <- head(deg_results[order(deg_results$wilcoxon_statistic, decreasing = FALSE), ], 20)
+selected_genes <- unique(c(top20$gene, bottom20$gene))
+
+ordered_genes <- deg_results %>%
+  filter(gene %in% selected_genes) %>%
+  arrange(desc(wilcoxon_statistic)) %>%
+  pull(gene)
+
+DefaultAssay(Monocytes) <- "SCT"
+Monocytes$orig.ident <- factor(Monocytes$orig.ident, levels = c("Non-sonicated", "Sonicated"))
+
+dot_plot <- DotPlot(
+  Monocytes,
+  features = ordered_genes,
+  group.by = "orig.ident",
+  assay = "SCT",
+  dot.scale = 8
+) +
+  scale_color_gradientn(colors = colors_blueYellow, name = "Scaled Expression\n(z-scores)") +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, family = "Helvetica", face = "italic"),
+    axis.text.y = element_text(size = 14, family = "Helvetica"),
+    text        = element_text(family = "Helvetica"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.title = element_text(family = "Helvetica")
+  )
+
+dot_plot <- dot_plot +
+  geom_point(
+    data = dot_plot$data,
+    mapping = aes(x = features.plot, y = id, size = pct.exp),
+    shape = 21, fill = NA, color = "black", stroke = 0.5
+  )
+
+print(dot_plot)
+
+```
+
+```{r}
+#Extended Data Figure 3c
+
+top20$group    <- "up"
+bottom20$group <- "down"
+bar_data <- dplyr::bind_rows(top20, bottom20)
+
+ordered_genes <- deg_results %>%
+  filter(gene %in% unique(bar_data$gene)) %>%
+  arrange(desc(wilcoxon_statistic)) %>%
+  pull(gene)
+bar_data$gene <- factor(bar_data$gene, levels = ordered_genes)
+
+ggplot(bar_data, aes(x = gene, y = wilcoxon_statistic, fill = group)) +
+  geom_col() +
+  scale_fill_manual(values = c("up" = "#01747a", "down" = "#01747a")) +
+  labs(x = "Gene", y = "Wilcoxon\nStatistic") +
+  theme_bw() +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, family = "Helvetica", color = "black"),
+    axis.text.y = element_text(family = "Helvetica", color = "black"),
+    axis.title  = element_text(family = "Helvetica", color = "black"),
+    legend.text = element_text(family = "Helvetica", color = "black"),
+    legend.title= element_text(family = "Helvetica", color = "black")
+  )
+
+```
+
+#Dot plot for endothelial cells DEG
+```{r}
+#Extended Data Figure 3e
+
+deg_results <- read.csv("DEG_results_sonicated_vs_nonsonicated_endothelial.csv", stringsAsFactors = FALSE)
+
+top20    <- head(deg_results[order(deg_results$wilcoxon_statistic, decreasing = TRUE), ], 20)
+bottom20 <- head(deg_results[order(deg_results$wilcoxon_statistic, decreasing = FALSE), ], 20)
+selected_genes <- unique(c(top20$gene, bottom20$gene))
+
+ordered_genes <- deg_results %>%
+  filter(gene %in% selected_genes) %>%
+  arrange(desc(wilcoxon_statistic)) %>%
+  pull(gene)
+
+DefaultAssay(Endothelial) <- "SCT"
+Endothelial$orig.ident <- factor(Endothelial$orig.ident, levels = c("Non-sonicated", "Sonicated"))
+
+dot_plot <- DotPlot(
+  Endothelial,
+  features = ordered_genes,
+  group.by = "orig.ident",
+  assay = "SCT",
+  dot.scale = 8
+) +
+  scale_color_gradientn(colors = colors_blueYellow, name = "Scaled Expression\n(z-scores)") +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, family = "Helvetica", face = "italic"),
+    axis.text.y = element_text(size = 14, family = "Helvetica"),
+    text        = element_text(family = "Helvetica"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.title = element_text(family = "Helvetica")
+  )
+
+dot_plot <- dot_plot +
+  geom_point(
+    data = dot_plot$data,
+    mapping = aes(x = features.plot, y = id, size = pct.exp),
+    shape = 21, fill = NA, color = "black", stroke = 0.5
+  )
+
+print(dot_plot)
+
+```
+
+```{r}
+#Extended Data Figure 3e
+
+top20$group    <- "up"
+bottom20$group <- "down"
+bar_data <- dplyr::bind_rows(top20, bottom20)
+
+ordered_genes <- deg_results %>%
+  filter(gene %in% unique(bar_data$gene)) %>%
+  arrange(desc(wilcoxon_statistic)) %>%
+  pull(gene)
+bar_data$gene <- factor(bar_data$gene, levels = ordered_genes)
+
+ggplot(bar_data, aes(x = gene, y = wilcoxon_statistic, fill = group)) +
+  geom_col() +
+  scale_fill_manual(values = c("up" = "#01747a", "down" = "#01747a")) +
+  labs(x = "Gene", y = "Wilcoxon\nStatistic") +
+  theme_bw() +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, family = "Helvetica", color = "black"),
+    axis.text.y = element_text(family = "Helvetica", color = "black"),
+    axis.title  = element_text(family = "Helvetica", color = "black"),
+    legend.text = element_text(family = "Helvetica", color = "black"),
+    legend.title= element_text(family = "Helvetica", color = "black")
+  )
+
+```
+

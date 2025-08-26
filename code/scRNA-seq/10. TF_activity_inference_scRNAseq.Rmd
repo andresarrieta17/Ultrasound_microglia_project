@@ -1,0 +1,180 @@
+---
+title: "10. TF_activity_inference_scRNAseq"
+author: "Victor A. Arrieta"
+date: "2025-08-25"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# (optional) installs – do outside the Rmd or wrap in conditionals
+# if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+# remotes::install_github("saezlab/OmnipathR")
+
+library(Seurat)
+library(decoupleR)
+library(OmnipathR)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(patchwork)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(purrr)     # for map_dbl, used later
+library(forcats)   # fct_reorder
+library(ArchR)
+```
+
+```{r}
+# Load object
+Microglia_filtered <- readRDS("Microglia_filtered.rds")
+
+# ---- Choose ONE assay to power TF inference (here: RNA log-normalized) ----
+DefaultAssay(Microglia_filtered) <- "RNA"
+Microglia_filtered <- NormalizeData(
+  Microglia_filtered, assay = "RNA",
+  normalization.method = "LogNormalize", scale.factor = 1e4, verbose = FALSE
+)
+
+mat <- as.matrix(GetAssayData(Microglia_filtered, assay = "RNA", slot = "data"))
+```
+
+```{r}
+# CollecTRI network (human)
+net <- get_collectri(organism = "human", split_complexes = FALSE)
+
+# ULM TF activity (rows: TF, columns: cells)
+acts <- run_ulm(
+  mat = mat, net = net,
+  .source = "source", .target = "target", .mor = "mor",
+  minsize = 5
+)
+
+# Store as a Seurat assay 'tfsulm'
+Microglia_filtered[["tfsulm"]] <- acts %>%
+  tidyr::pivot_wider(id_cols = "source", names_from = "condition", values_from = "score") %>%
+  column_to_rownames("source") %>%
+  CreateAssayObject()
+
+# Optionally z-scale TF activities for plotting
+DefaultAssay(Microglia_filtered) <- "tfsulm"
+Microglia_filtered <- ScaleData(Microglia_filtered, verbose = FALSE)
+# Use scaled values as the assay's 'data' so FeaturePlot uses z-scores
+Microglia_filtered@assays$tfsulm@data <- Microglia_filtered@assays$tfsulm@scale.data
+
+```
+
+#Compare mean TF activity (Sonicated vs Non-sonicated)
+```{r}
+#Figure 5d
+
+# Set the column that holds your condition
+status_col <- "orig.ident"  # or "sonication_status" if that's what you use
+table(Microglia_filtered[[status_col]][,1])
+
+# Ensure consistent labels
+Microglia_filtered[[status_col]] <- factor(
+  Microglia_filtered[[status_col]][,1],
+  levels = c("Non-sonicated", "Sonicated")
+)
+
+tfs_mat <- GetAssayData(Microglia_filtered, assay = "tfsulm", slot = "data")
+
+mean_non  <- rowMeans(tfs_mat[, Microglia_filtered[[status_col]][,1] == "Non-sonicated", drop = FALSE])
+mean_sono <- rowMeans(tfs_mat[, Microglia_filtered[[status_col]][,1] == "Sonicated",     drop = FALSE])
+
+df0 <- tibble(
+  TF         = rownames(tfs_mat),
+  mean_non   = mean_non[rownames(tfs_mat)],
+  mean_sono  = mean_sono[rownames(tfs_mat)],
+  diff       = mean_sono - mean_non,
+  category   = if_else(diff >= 0, "Sonication", "Non-sonication")
+)
+
+# Top N from each side
+n <- 15
+top_son <- df0 %>% filter(category == "Sonication")     %>% arrange(desc(diff)) %>% slice_head(n = n)
+top_non <- df0 %>% filter(category == "Non-sonication") %>% arrange(     diff) %>% slice_head(n = n)
+
+bar_df <- bind_rows(top_son, top_non) %>%
+  arrange(desc(diff)) %>%
+  mutate(TF = factor(TF, levels = TF))
+
+ggplot(bar_df, aes(x = TF, y = diff, fill = category)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values = c("Sonication" = "#542788", "Non-sonication" = "#00BCD4"), name = NULL) +
+  labs(x = "Transcription Factor",
+       y = "Mean activity difference\n(Sonicated − Non-sonicated)") +
+  theme_classic(base_family = "Helvetica") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+```
+
+#UMAPs of TF activity vs gene expression and Split UMAPs by condition (consistent order + shared scale)
+```{r}
+#Figure 5e
+
+# Re‐level orig.ident so “Sonicated” comes first
+Microglia_filtered$orig.ident <- factor(
+  Microglia_filtered$orig.ident,
+  levels = c("Sonicated", "Non-sonicated")
+)
+
+# Activate the TF‐activity assay
+DefaultAssay(Microglia_filtered) <- "tfsulm"
+
+# Clamp at ±2
+lims <- c(-2, 2)
+
+# Build the 256‐color solarExtra ramp
+ramp <- colorRampPalette(ArchRPalettes$solarExtra)(256)
+
+# Get separate UMAPs (now in the order of the factor levels)
+plots <- FeaturePlot(
+  Microglia_filtered,
+  features   = "FOS",
+  reduction   = "umap",
+  split.by   = "orig.ident",
+  combine    = FALSE,
+  pt.size    = 0.5
+)
+
+# Apply the same color scale + theme
+plots <- lapply(plots, function(p) {
+  p +
+    scale_color_gradientn(
+      colours = ramp,
+      limits  = lims,
+      oob     = scales::squish
+    ) +
+    theme_void(base_family = "Helvetica") +
+    theme(
+      strip.text      = element_text(color = "black", family = "Helvetica"),
+      legend.position = "right",
+      legend.title    = element_text(color = "black", family = "Helvetica"),
+      legend.text     = element_text(color = "black", family = "Helvetica")
+    )
+})
+
+# Stitch together with a single legend and title
+combined <- wrap_plots(plots, nrow = 1, guides = "collect") +
+  plot_annotation(
+    theme = theme(
+      plot.title = element_text(hjust = 0.5, family = "Helvetica", size = 16)
+    )
+  ) &
+  theme(
+    legend.position = "right",
+    legend.title    = element_text(size = 14, family = "Helvetica"),
+    legend.text     = element_text(size = 16, family = "Helvetica")
+  )
+
+# Show it
+print(combined)
+
+```
+
+

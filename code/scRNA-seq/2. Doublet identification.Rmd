@@ -1,0 +1,116 @@
+---
+title: "2. Doublet identification"
+author: "Victor A. Arrieta"
+date: "2025-08-24"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+library(Seurat)
+library(DoubletFinder)
+library(ggplot2)
+
+```
+
+Step 1: Scale, PCA, UMAP, clustering
+```{r}
+process_data <- function(seurat_objects) {
+  lapply(seurat_objects, function(seurat_obj) {
+    seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+    seurat_obj <- RunPCA(seurat_obj, npcs = 30, verbose = FALSE)
+    seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dims = 1:20)
+    seurat_obj <- FindNeighbors(seurat_obj, reduction = "pca", dims = 1:20)
+    seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+    seurat_obj
+  })
+}
+
+nonsoni_objects <- process_data(nonsoni_objects)
+soni_objects    <- process_data(soni_objects)
+
+```
+
+Step 2: DoubletFinder
+```{r}
+run_doublet_finder <- function(seurat_obj, PCs = 1:20, pN = 0.25, nExp_ratio = 0.075) {
+  # Parameter sweep and pK selection
+  sweep.res   <- paramSweep(seurat_obj, PCs = PCs, sct = TRUE)
+  sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+  bcmvn       <- find.pK(sweep.stats)
+
+  # ensure numeric pK
+  bcmvn$pK <- as.numeric(as.character(bcmvn$pK))
+
+  # visualize BCmetric vs pK (for reference)
+  print(
+    ggplot(bcmvn, aes(x = pK, y = BCmetric)) +
+      geom_point() + geom_line() +
+      labs(title = "DoubletFinder: BCmetric vs pK", x = "pK", y = "BCmetric")
+  )
+
+  optimal_pk <- bcmvn$pK[which.max(bcmvn$BCmetric)]
+
+  # homotypic adjustment
+  annotations    <- seurat_obj@meta.data$seurat_clusters
+  homotypic.prop <- modelHomotypic(annotations)
+
+  # expected doublets (Poisson) and adjusted for homotypic rate
+  nExp_poi      <- round(nrow(seurat_obj@meta.data) * nExp_ratio)
+  nExp_poi.adj  <- round(nExp_poi * (1 - homotypic.prop))
+
+  # run DoubletFinder
+  seurat_obj <- doubletFinder(
+    seurat_obj,
+    PCs        = PCs,
+    pN         = pN,
+    pK         = optimal_pk,
+    nExp       = nExp_poi.adj,
+    reuse.pANN = FALSE,
+    sct        = TRUE
+  )
+
+  seurat_obj
+}
+
+nonsoni_objects <- lapply(nonsoni_objects, run_doublet_finder)
+soni_objects    <- lapply(soni_objects,    run_doublet_finder)
+
+```
+
+Step 3: Remove doublets
+```{r}
+subset_doublets <- function(seurat_obj, pick_last = TRUE) {
+  # pick a DF.classifications_* column (exclude pANN)
+  cls_cols <- grep("^DF\\.classifications_", colnames(seurat_obj@meta.data), value = TRUE)
+  cls_cols <- cls_cols[!grepl("pANN", cls_cols, ignore.case = TRUE)]
+
+  if (length(cls_cols) == 0) stop("No DoubletFinder classification column found.")
+
+  classification_col <- if (length(cls_cols) == 1) cls_cols else {
+    if (pick_last) tail(cls_cols, 1) else head(cls_cols, 1)
+  }
+
+  keep_cells <- rownames(seurat_obj@meta.data)[
+    seurat_obj@meta.data[[classification_col]] != "Doublet"
+  ]
+  seurat_obj[, keep_cells]
+}
+
+nonsoni_objects_filtered <- lapply(nonsoni_objects, subset_doublets)
+soni_objects_filtered    <- lapply(soni_objects,    subset_doublets)
+
+# dimensions before/after for first sample in each group
+if (length(nonsoni_objects)) {
+  print(dim(nonsoni_objects[[1]]))
+  print(dim(nonsoni_objects_filtered[[1]]))
+}
+if (length(soni_objects)) {
+  print(dim(soni_objects[[1]]))
+  print(dim(soni_objects_filtered[[1]]))
+}
+
+```
+

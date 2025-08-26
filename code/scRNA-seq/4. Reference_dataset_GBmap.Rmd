@@ -1,0 +1,117 @@
+---
+title: "4. Reference_dataset_GBmap"
+author: "Victor A. Arrieta"
+date: "2025-08-24"
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+set.seed(33)
+
+library(Seurat)
+library(Azimuth)
+library(stringr)
+```
+
+```{r}
+# Load the GBmap reference dataset and the integrated dataset that includes sonicated and non-sonicated samples
+az_ref <- readRDS("GBMap.rds") 
+integrated_data <- readRDS("integrated_data.rds")
+
+# Work on a copy for annotation
+integrated_data_copy <- integrated_data
+```
+
+
+```{r}
+# Build log-normalized PCA/UMAP for the reference; keep UMAP model for projection
+az_ref <- NormalizeData(az_ref, normalization.method = "LogNormalize", scale.factor = 10000)
+az_ref <- FindVariableFeatures(az_ref, selection.method = "vst", nfeatures = 2000)
+az_ref <- ScaleData(az_ref, features = VariableFeatures(az_ref), verbose = FALSE)
+az_ref <- RunPCA(az_ref, npcs = 30, verbose = FALSE)
+```
+
+```{r}
+# Clean annotation names in reference
+az_ref$annotation_level_4 <- az_ref$annotation_level_4 %>%
+  str_replace_all("[ ]", "_") %>%
+  str_replace_all("-", "_") %>%
+  str_replace_all("/", "_")
+```
+
+```{r}
+# Use RNA assay for mapping
+DefaultAssay(integrated_data_copy) <- "RNA"
+
+# Remove SCT assay from the copy (if present)
+integrated_data_copy[["SCT"]] <- NULL
+
+# If RNA assay has layered matrices, unify them
+integrated_data_copy <- JoinLayers(object = integrated_data_copy, assay = "RNA")
+```
+
+```{r}
+# Gene name conversion (custom helpers)
+homolog_table_path <- "homologs.rds"
+source("modified_azimuth_for_cell_annotation.R")
+
+# Convert both query and reference to a consistent gene namespace
+integrated_data_copy <- ConvertGeneNames_1(
+  object          = integrated_data_copy,
+  reference.names = rownames(az_ref),
+  homolog.table   = homolog_table_path
+)
+
+az_ref <- ConvertGeneNames_1(
+  object          = az_ref,
+  reference.names = rownames(az_ref),
+  homolog.table   = homolog_table_path
+)
+
+# Inspect overlap
+common_genes <- intersect(rownames(integrated_data_copy), rownames(az_ref))
+message("Number of common genes: ", length(common_genes))
+
+```
+
+```{r}
+# Cell annotation using Azimuth with the prepared reference
+DefaultAssay(integrated_data_copy) <- "RNA"
+
+integrated_data_copy <- RunAzimuth(
+  query = integrated_data_copy,
+  reference = az_ref,
+  annotation.levels = c("annotation_level_2", "annotation_level_3", "annotation_level_4"),
+  verbose = TRUE,
+  assay = "RNA"
+)
+
+# Ensure a UMAP exists on the query
+if (!"umap" %in% Reductions(integrated_data_copy)) {
+  integrated_data_copy <- RunUMAP(integrated_data_copy, reduction = "pca", dims = 1:20)
+}
+
+```
+
+```{r}
+# Transfer predicted annotations from the copy back to the original object
+annotation_cols <- c(
+  "predicted.annotation_level_2",
+  "predicted.annotation_level_3",
+  "predicted.annotation_level_4",
+  "predicted.annotation_level_2.score",
+  "predicted.annotation_level_3.score",
+  "predicted.annotation_level_4.score",
+  "mapping.score"
+)
+
+common_cells <- intersect(colnames(integrated_data), colnames(integrated_data_copy))
+
+for (colname in annotation_cols) {
+  if (!colname %in% colnames(integrated_data_copy@meta.data)) next
+  if (!colname %in% colnames(integrated_data@meta.data)) integrated_data[[colname]] <- NA
+  integrated_data@meta.data[common_cells, colname] <- integrated_data_copy@meta.data[common_cells, colname]
+}
+```
+

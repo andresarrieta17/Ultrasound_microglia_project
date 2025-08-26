@@ -1,0 +1,109 @@
+---
+title: "Microglia_subset_Calling_and_Identifying_Peaks"
+author: "Victor A. Arrieta"
+date: "2025-08-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# Load the package from the personal library
+library(BSgenome.Hsapiens.UCSC.hg38)
+```
+
+```{r}
+# Load a previously saved ArchR project
+microglia <- readRDS("Microglia_multiome_with_embeddings.rds")
+
+# Analysis 1: Based on "celltype_simple" and "SonicationStatus"
+
+# Add Group Coverages for Combined Groups without assigning back to the project
+microglia <- addGroupCoverages(
+  ArchRProj = microglia,
+  groupBy = "SonicationStatus"
+)
+
+# Obtain Group Assignments for Combined Groups and store them separately
+Groups <- addGroupCoverages(
+  ArchRProj = microglia,
+  groupBy = "SonicationStatus",
+  returnGroups = TRUE
+)
+
+# Verify Group Coverages
+print(microglia@projectMetadata$GroupCoverages$SonicationStatus$coverageMetadata)
+```
+
+
+Calling Peaks w/ Macs2
+```{r}
+pathToMacs2 <- "/home..." #Adjust this path according your local environment
+
+system(paste(pathToMacs2, "--version"))
+system2(pathToMacs2, "callpeak -h")
+
+# Perform peak calling in ArchR
+microglia <- addReproduciblePeakSet(
+  ArchRProj = microglia,
+  groupBy = "SonicationStatus",
+  pathToMacs2 = pathToMacs2,
+  cutOff = 0.01,
+  threads = 80
+)
+
+getPeakSet(microglia)
+
+#Adding a new matrix (peaks) containing insertion counts 
+microglia <- addPeakMatrix(ArchRProj = microglia)
+getAvailableMatrices(microglia)
+
+#Check the cell types in the context of sonication status and their numbers
+table(microglia$SonicationStatus)
+```
+
+
+#To extract the peaks
+```{r}
+# Identify marker peaks
+markersPeaks_microglia <- getMarkerFeatures(
+  ArchRProj = microglia,                      # The ArchR project object you just worked on
+  useMatrix = 'PeakMatrix',              # Matrix to be used for peak identification
+  groupBy = 'SonicationStatus',       # Grouping by your combined cell type and sonication
+  bias = c('TSSEnrichment', 'log10(nFrags)'), # Bias correction for TSS and fragment count
+  testMethod = 'wilcoxon'                # Wilcoxon test for identifying marker peaks
+)
+
+#To inspect the new object
+markersPeaks_microglia
+```
+
+
+```{r}
+# Re-order the two status columns so Sonicated comes first
+statusOrder <- c("Sonicated", "Non-sonicated")
+
+markersPeaks_microglia  <- markersPeaks_microglia[ , statusOrder]
+```
+
+# Create the Volcano plot for Microglia_Sonicated vs Microglia_Non-sonicated
+```{r}
+#Figure 5a
+
+pv <- plotMarkers(
+  seMarker = markersPeaks_microglia,
+  name = "Sonicated",  # Use the correct column name
+  cutOff = "FDR <= 0.1 & abs(Log2FC) >= 0.1", # Customize the cutoffs as needed
+  plotAs = "Volcano"
+)
+
+# Show the plot and save it from the console for Microglia, Macrophages, and Monocytes
+pv
+
+```
+
+#Save the final ArchR object
+```{r}
+saveRDS(microglia, file = "Microglia_multiome_with_peaks.rds")
+```
+
